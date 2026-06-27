@@ -173,3 +173,151 @@ func TestNormalizeImportAuthMethod(t *testing.T) {
 		})
 	}
 }
+
+// TestApiImportCredentialsExternalIdpHappyPath verifies an external_idp credential
+// imports successfully: authMethod normalizes to external_idp, refresh hits the
+// (fake) IdP token endpoint, and the account is persisted with all refresh material.
+func TestApiImportCredentialsExternalIdpHappyPath(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	defer installCleanAuthClient(t)()
+
+	const upstreamExpiresIn = 3600
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+		if got := r.PostForm.Get("grant_type"); got != "refresh_token" {
+			t.Errorf("expected grant_type=refresh_token, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// external IdP token responses are snake_case.
+		fmt.Fprintf(w, `{"access_token":"at-ext","refresh_token":"rt-rotated","expires_in":%d}`, upstreamExpiresIn)
+	}))
+	defer fake.Close()
+
+	// fake.URL is http + 127.0.0.1; bypass the allow-list validator for this test.
+	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer auth.SetExternalIdpValidatorForTest(restore)
+
+	h := &Handler{pool: accountpool.GetPool()}
+
+	body := fmt.Sprintf(`{"authMethod":"external_idp","refreshToken":"rt-ext","clientId":"ext-client","tokenEndpoint":%q,"issuerUrl":"https://login.microsoftonline.com/t/v2.0","scopes":"api://x/codewhisperer:conversations offline_access","region":"eu-central-1"}`, fake.URL)
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	before := time.Now().Unix()
+	h.apiImportCredentials(rec, req)
+	after := time.Now().Unix()
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	accs := config.GetAccounts()
+	if len(accs) != 1 {
+		t.Fatalf("expected 1 account persisted, got %d", len(accs))
+	}
+	got := accs[0]
+	if got.AuthMethod != "external_idp" {
+		t.Fatalf("AuthMethod: want external_idp, got %q", got.AuthMethod)
+	}
+	if got.AccessToken != "at-ext" {
+		t.Fatalf("AccessToken: want at-ext, got %q", got.AccessToken)
+	}
+	if got.RefreshToken != "rt-rotated" {
+		t.Fatalf("RefreshToken: want rt-rotated (rotated), got %q", got.RefreshToken)
+	}
+	if got.TokenEndpoint != fake.URL {
+		t.Fatalf("TokenEndpoint not persisted: got %q", got.TokenEndpoint)
+	}
+	if got.ClientID != "ext-client" {
+		t.Fatalf("ClientID not persisted: got %q", got.ClientID)
+	}
+	if got.Scopes == "" {
+		t.Fatalf("Scopes not persisted: got %q", got.Scopes)
+	}
+	if got.Provider != "AzureAD" {
+		t.Fatalf("Provider default: want AzureAD, got %q", got.Provider)
+	}
+	if got.Region != "eu-central-1" {
+		t.Fatalf("Region: want eu-central-1, got %q", got.Region)
+	}
+	if got.ExpiresAt < before+upstreamExpiresIn-5 || got.ExpiresAt > after+upstreamExpiresIn+5 {
+		t.Fatalf("ExpiresAt not from upstream expiresIn: got %d (want ~now+%d)", got.ExpiresAt, upstreamExpiresIn)
+	}
+}
+
+// TestApiImportCredentialsExternalIdpRejectsNonAllowListedEndpoint verifies the SSRF
+// guard: a tokenEndpoint outside the IdP allow-list is rejected with 400 before any
+// refresh POST, and nothing is persisted. (Validator is NOT bypassed here.)
+func TestApiImportCredentialsExternalIdpRejectsNonAllowListedEndpoint(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	defer installCleanAuthClient(t)()
+
+	h := &Handler{pool: accountpool.GetPool()}
+
+	body := `{"authMethod":"external_idp","refreshToken":"rt","clientId":"c","tokenEndpoint":"https://evil.example.com/oauth/token","region":"us-east-1"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !strings.Contains(resp["error"], "endpoint rejected") {
+		t.Fatalf("expected endpoint-rejected error, got %q", resp["error"])
+	}
+	if accs := config.GetAccounts(); len(accs) != 0 {
+		t.Fatalf("expected no account persisted, got %d", len(accs))
+	}
+}
+
+// TestApiImportCredentialsExternalIdpRejectsWhenRefreshFails verifies the refresh
+// gate holds for external_idp: a refresh that 400s (invalid_grant) must reject the
+// import and persist nothing.
+func TestApiImportCredentialsExternalIdpRejectsWhenRefreshFails(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	defer installCleanAuthClient(t)()
+
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+	}))
+	defer fake.Close()
+
+	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer auth.SetExternalIdpValidatorForTest(restore)
+
+	h := &Handler{pool: accountpool.GetPool()}
+
+	body := fmt.Sprintf(`{"authMethod":"external_idp","refreshToken":"rt-broken","clientId":"c","tokenEndpoint":%q,"region":"us-east-1"}`, fake.URL)
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !strings.Contains(resp["error"], "Token refresh failed") {
+		t.Fatalf("expected refresh-failed error, got %q", resp["error"])
+	}
+	if accs := config.GetAccounts(); len(accs) != 0 {
+		t.Fatalf("expected no account persisted, got %d", len(accs))
+	}
+}

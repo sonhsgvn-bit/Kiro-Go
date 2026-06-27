@@ -3014,6 +3014,14 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		AuthMethod   string `json:"authMethod"`
 		Provider     string `json:"provider"`
 		Region       string `json:"region"`
+		// external_idp (enterprise SSO / Azure AD) refresh material.
+		TokenEndpoint string `json:"tokenEndpoint"`
+		IssuerURL     string `json:"issuerUrl"`
+		Scopes        string `json:"scopes"`
+		// Optional identity preservation when pasting a full account record.
+		ID         string `json:"id"`
+		Email      string `json:"email"`
+		ProfileArn string `json:"profileArn"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3031,24 +3039,29 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	if req.Region == "" {
 		req.Region = "us-east-1"
 	}
-	if req.AuthMethod == "" {
-		if req.ClientID != "" {
-			req.AuthMethod = "idc"
-		} else {
-			req.AuthMethod = "social"
+	// 标准化 authMethod。external_idp 必须先于 clientId+clientSecret→idc 的推断被识别
+	//（external_idp 带 clientId 但没有 clientSecret），否则会被误判成 social 而 refresh 到错误端点。
+	req.AuthMethod = normalizeImportAuthMethod(req.AuthMethod, req.ClientID, req.ClientSecret, req.TokenEndpoint)
+
+	// external_idp 的 tokenEndpoint 是用户可填的新信任边界：必须经 allow-list 校验，
+	// 否则一份不信任的 credential JSON 可指向内网/攻击者主机，导致 refresh token 被外泄。
+	if req.AuthMethod == "external_idp" {
+		if req.ClientID == "" || req.TokenEndpoint == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "external_idp requires clientId and tokenEndpoint"})
+			return
 		}
-	}
-	// 标准化 authMethod
-	switch strings.ToLower(req.AuthMethod) {
-	case "idc", "builderid", "enterprise":
-		req.AuthMethod = "idc"
-	case "social", "google", "github":
-		req.AuthMethod = "social"
-	default:
-		if req.ClientID != "" && req.ClientSecret != "" {
-			req.AuthMethod = "idc"
-		} else {
-			req.AuthMethod = "social"
+		if err := auth.ValidateExternalIdpEndpoint(req.TokenEndpoint); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "external IdP endpoint rejected: " + err.Error()})
+			return
+		}
+		if req.IssuerURL != "" {
+			if err := auth.ValidateExternalIdpEndpoint(req.IssuerURL); err != nil {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": "external IdP issuer rejected: " + err.Error()})
+				return
+			}
 		}
 	}
 
@@ -3056,11 +3069,13 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	// 本地缓存里的 accessToken 不携带可信的过期时间，盲猜短 TTL 会让账号在选号时
 	// 永远被跳过，导致后台/按需刷新都无法触发（详见 ensureValidToken 与 Pick 的过期判定）。
 	tempAccount := &config.Account{
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Region:       req.Region,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Region:        req.Region,
+		TokenEndpoint: req.TokenEndpoint,
+		Scopes:        req.Scopes,
 	}
 	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
 	if err != nil {
@@ -3076,20 +3091,27 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	email, _, _ := auth.GetUserInfo(accessToken)
 
 	// 创建账号
+	provider := req.Provider
+	if provider == "" && req.AuthMethod == "external_idp" {
+		provider = "AzureAD"
+	}
 	account := config.Account{
-		ID:           auth.GenerateAccountID(),
-		Email:        email,
-		AccessToken:  accessToken,
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Provider:     req.Provider,
-		Region:       req.Region,
-		ExpiresAt:    expiresAt,
-		Enabled:      true,
-		MachineId:    config.GenerateMachineId(),
-		ProfileArn:   newProfileArn,
+		ID:            auth.GenerateAccountID(),
+		Email:         email,
+		AccessToken:   accessToken,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Provider:      provider,
+		Region:        req.Region,
+		ExpiresAt:     expiresAt,
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+		ProfileArn:    newProfileArn,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerURL:     req.IssuerURL,
+		Scopes:        req.Scopes,
 	}
 
 	if err := config.AddAccount(account); err != nil {
