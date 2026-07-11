@@ -979,6 +979,11 @@
           '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '">' +
           escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) +
           '</button>') +
+        // external_idp (Azure tenant) credentials can hold Kiro profiles in several
+        // regions; expose a switcher so a wrongly-pinned account (e.g. US instead
+        // of EU) can be re-pinned without re-authenticating.
+        (a.authMethod === 'external_idp' ?
+          '<button class="btn btn-sm btn-outline" data-action="switchProfile" data-id="' + idAttr + '">' + escapeHtml(t('kirosso.switchProfile')) + '</button>' : '') +
         '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '">' + escapeHtml(t('accounts.test')) + '</button>' +
         '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
         '</div>' +
@@ -1005,6 +1010,54 @@
     }).join('');
     applyUsageBars(container);
     enhanceCustomSelects(container);
+  }
+
+  // Opens the profile switcher for an existing external_idp account: fetches the
+  // multi-region discovery from the backend, then reuses the add-account modal
+  // shell for a radio picker. POSTing the chosen ARN re-pins the account's
+  // data-plane region (validated server-side against a fresh discovery).
+  async function openSwitchProfileModal(id, btn) {
+    if (btn) btn.disabled = true;
+    let d = {};
+    try {
+      const res = await api('/accounts/' + id + '/kiro-profiles');
+      d = await res.json().catch(() => ({}));
+    } catch (e) { /* handled below via d.success check */ }
+    if (btn) btn.disabled = false;
+    if (!d.success) { toastError(t('common.failed') + ': ' + (d.error || '')); return; }
+    const profiles = d.profiles || [];
+    // "Nothing to switch to" means no profile OTHER than the current pin exists.
+    // A single discovered profile that differs from the current (possibly stale)
+    // pin is exactly the recovery case this switcher exists for — show it.
+    if (!profiles.some(p => p.arn !== (d.current || ''))) { toastPrimary(t('kirosso.noAltProfiles')); return; }
+    const title = $('modalTitle');
+    const body = $('modalBody');
+    title.textContent = t('kirosso.switchProfileTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('kirosso.switchProfileDesc')) + '</p>' +
+      '<div id="switchProfileList">' + kiroProfileListHtml(profiles, d.current || '') + '</div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="switchProfileConfirmBtn" type="button">' + escapeHtml(t('kirosso.useProfile')) + '</button>' +
+      '</div>';
+    $('switchProfileConfirmBtn').addEventListener('click', async e => {
+      const confirmBtn = e.currentTarget;
+      const sel = body.querySelector('input[name="kiroProfilePick"]:checked');
+      if (!sel || confirmBtn.disabled) return;
+      // The POST triggers a full multi-region discovery server-side; block
+      // double-clicks so it cannot run twice concurrently.
+      confirmBtn.disabled = true;
+      const res2 = await api('/accounts/' + id + '/kiro-profiles', { method: 'POST', body: JSON.stringify({ profileArn: sel.value }) }).catch(() => null);
+      const d2 = res2 ? await res2.json().catch(() => ({})) : {};
+      if (d2.success) {
+        closeModal(); loadAccounts();
+        toastPrimary(t('kirosso.switchSuccess'));
+      } else {
+        toastError(t('common.failed') + ': ' + (d2.error || ''));
+        confirmBtn.disabled = false;
+      }
+    });
+    openDialog('addModal');
   }
 
   // Account actions
@@ -2489,8 +2542,71 @@
       '</div>' +
       '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
       '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
+      '</div>' +
+      // Step 3 (shown only when the backend discovered 2+ Kiro profiles across
+      // regions for this credential): the operator must pick which profile the
+      // new account is pinned to before it is created.
+      '<div id="kiroSsoStep3" class="hidden">' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.chooseProfile')) + '</p></div>' +
+      '<div id="kiroSsoProfileList" class="mt-3"></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" id="kiroSsoProfileCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="kiroSsoProfileConfirmBtn" type="button">' + escapeHtml(t('kirosso.useProfile')) + '</button>' +
+      '</div>' +
       '</div>';
     $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
+  }
+  // Renders the discovered profiles as a radio list. The label leads with the
+  // profile's region (parsed from its ARN); the full ARN is shown underneath so
+  // two profiles in the same region stay distinguishable.
+  function kiroProfileListHtml(profiles, current) {
+    // Pre-check the current pin when it is in the list; otherwise (fresh login,
+    // or a stale pin the discovery no longer returns) default to the first entry
+    // so the confirm button always has a selection to act on.
+    const hasCurrent = !!current && profiles.some(p => p.arn === current);
+    return profiles.map((p, i) => {
+      const isCurrent = !!current && p.arn === current;
+      const checked = hasCurrent ? (isCurrent ? ' checked' : '') : (i === 0 ? ' checked' : '');
+      return '<label class="method-card" style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:8px">' +
+        '<input type="radio" name="kiroProfilePick" value="' + escapeAttr(p.arn) + '"' + checked + ' />' +
+        '<span><span class="font-mono">' + escapeHtml(p.region || '') + '</span>' +
+        (isCurrent ? ' <span class="badge badge-info">' + escapeHtml(t('kirosso.currentProfile')) + '</span>' : '') +
+        '<br/><span class="text-xs muted-text font-mono">' + escapeHtml(p.arn) + '</span></span>' +
+        '</label>';
+    }).join('');
+  }
+  // Switches the enterprise SSO modal to the profile-choice step and wires its
+  // buttons. Cancel goes through cancelKiroSsoLogin so the backend also drops
+  // the tokens parked for this choice.
+  function showKiroSsoProfileChoice(profiles) {
+    $('kiroSsoStep2').classList.add('hidden');
+    $('kiroSsoStep3').classList.remove('hidden');
+    $('kiroSsoProfileList').innerHTML = kiroProfileListHtml(profiles, '');
+    $('kiroSsoProfileCancelBtn').addEventListener('click', cancelKiroSsoLogin);
+    $('kiroSsoProfileConfirmBtn').addEventListener('click', async e => {
+      const btn = e.currentTarget;
+      const sel = document.querySelector('input[name="kiroProfilePick"]:checked');
+      if (!sel || btn.disabled) return;
+      btn.disabled = true; // guard against a double-click firing two finalize POSTs
+      const res = await api('/auth/kiro-sso/select-profile', {
+        method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession, profileArn: sel.value })
+      }).catch(() => null);
+      const d = res ? await res.json().catch(() => ({})) : {};
+      if (d.success) {
+        // Clear the session before closeModal so it does not fire a redundant
+        // cancel for a sign-in that just completed.
+        kiroSsoSession = '';
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+        autoRefreshNewAccount(d.account?.id);
+      } else {
+        // Most likely the 5-minute choice window expired server-side; Step 3 is
+        // a dead end then, so restart the flow instead of stranding the operator.
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+        btn.disabled = false;
+        cancelKiroSsoLogin();
+      }
+    });
   }
   async function startKiroSsoLogin() {
     // No region prompt: the data-plane region is derived from the profile ARN
@@ -2518,7 +2634,15 @@
     kiroSsoPollTimer = setTimeout(async () => {
       const res = await api('/auth/kiro-sso/poll', { method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession }) });
       const d = await res.json();
-      if (d.completed) {
+      if (d.status === 'choose_profile') {
+        // Tokens are exchanged but the account is NOT created yet: the backend
+        // found several Kiro profiles (regions) for this credential. Keep the
+        // session id — select-profile needs it — and show the picker step.
+        // A malformed profile list must NOT fall through to the success branch
+        // (no account exists yet); abort the flow instead.
+        if (Array.isArray(d.profiles) && d.profiles.length) showKiroSsoProfileChoice(d.profiles);
+        else { toastError(t('common.failed')); cancelKiroSsoLogin(); }
+      } else if (d.completed) {
         // Session is already consumed server-side; clear it so closeModal() does
         // not fire a redundant cancel for an account that succeeded.
         kiroSsoSession = '';
@@ -2917,6 +3041,7 @@
       else if (action === 'copyJSON') copyAccountJSON(id, btn);
       else if (action === 'toggle') toggleAccount(id, btn.dataset.enabled === 'true');
       else if (action === 'test') testAccount(id);
+      else if (action === 'switchProfile') openSwitchProfileModal(id, btn);
       else if (action === 'delete') deleteAccount(id);
     });
   }

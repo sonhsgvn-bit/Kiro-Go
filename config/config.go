@@ -535,6 +535,9 @@ func SetAccountBanStatus(id, status, reason string) error {
 	return nil
 }
 
+// UpdateAccountProfileArn pins an account's profile ARN and persists it. A
+// missing id is an error (the account may have been deleted concurrently) so
+// callers cannot mistake a no-op for a successful write.
 func UpdateAccountProfileArn(id, profileArn string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -544,7 +547,7 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 			return Save()
 		}
 	}
-	return nil
+	return fmt.Errorf("account not found: %s", id)
 }
 
 func DeleteAccount(id string) error {
