@@ -158,6 +158,12 @@ func HasApiKeys() bool {
 
 // RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
 // updates LastUsedAt, increments RequestsCount, and persists.
+//
+// Quota enforcement: when the updated counters reach a configured limit
+// (token or credit), the key is deactivated (Enabled=false) in the same write.
+// This is the "sold quota" contract used by the Telegram bot flow — a key sold
+// with N credits stops working permanently once N credits are consumed, and
+// stays off until an admin re-enables it (e.g. after a top-up).
 func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -174,6 +180,10 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 			}
 			cfg.ApiKeys[i].RequestsCount++
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
+			// Auto-deactivate on quota exhaustion (see function comment).
+			if overToken, overCredit := ApiKeyOverLimit(cfg.ApiKeys[i]); overToken || overCredit {
+				cfg.ApiKeys[i].Enabled = false
+			}
 			return saveLocked()
 		}
 	}

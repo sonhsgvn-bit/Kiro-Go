@@ -25,6 +25,7 @@ type RequestLog struct {
 	Endpoint  string `json:"endpoint"`  // claude/openai/responses
 	Model     string `json:"model"`     // Requested model
 	AccountID string `json:"accountId"` // Account used
+	ApiKeyID  string `json:"apiKeyId,omitempty"` // API key entry that made the request (empty on legacy/unauthenticated paths)
 	Status    string `json:"status"`    // "success" or "error"
 	Error     string `json:"error"`     // Error message (empty on success)
 	ErrorType string `json:"errorType"` // Error category (empty on success)
@@ -404,6 +405,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Claude Code 遥测端点 - 直接返回 200 OK
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Write([]byte(`{"status":"ok"}`))
+
+	// 客户自助端点（用客户自己的 API Key 鉴权，只暴露该 Key 的数据）
+	case path == "/api/stats" && r.Method == "GET":
+		h.handleCustomerStats(w, r)
+	case path == "/api/me" && r.Method == "GET":
+		h.handleCustomerMe(w, r)
+	case path == "/api/logs" && r.Method == "GET":
+		h.handleCustomerLogs(w, r)
+
+	// 机器集成管理端点（Telegram 机器人等；管理密钥鉴权）。
+	// 必须放在通用 /admin/ 静态文件路由之前，否则会被误当作静态资源。
+	case path == "/admin/new_api_key" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminNewApiKey(w, r)
+	case path == "/admin/stats" && r.Method == "POST":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminBotStats(w, r)
+	case path == "/admin/pool" && r.Method == "GET":
+		if !h.authenticateAdminKey(w, r) {
+			return
+		}
+		h.handleAdminPool(w, r)
 
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
@@ -1223,7 +1250,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if !messageStarted {
 				continue
 			}
-			h.recordFailureWithDetails("claude", model, account.ID, err)
+			h.recordFailureWithDetails("claude", model, account.ID, apiKeyID, err)
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1256,7 +1283,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1283,7 +1310,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", model, "", apiKeyID, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1356,7 +1383,9 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 }
 
 // recordFailureWithDetails records a failure and stores it in the request logs.
-func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
+// apiKeyID attributes the failed request to the API key entry that issued it so
+// customer-facing log endpoints can show per-key failures; empty on legacy paths.
+func (h *Handler) recordFailureWithDetails(endpoint, model, accountID, apiKeyID string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 
@@ -1372,6 +1401,7 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 		Endpoint:  endpoint,
 		Model:     model,
 		AccountID: accountID,
+		ApiKeyID:  apiKeyID,
 		Status:    "error",
 		Error:     errMsg,
 		ErrorType: errType,
@@ -1381,12 +1411,14 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 }
 
 // recordSuccessLog records a successful request in the request logs.
-func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
+// apiKeyID attributes the request to the API key entry that issued it (see above).
+func (h *Handler) recordSuccessLog(endpoint, model, accountID, apiKeyID string, tokens int, credits float64, durationMs int64) {
 	entry := RequestLog{
 		Time:      time.Now().Unix(),
 		Endpoint:  endpoint,
 		Model:     model,
 		AccountID: accountID,
+		ApiKeyID:  apiKeyID,
 		Status:    "success",
 		Tokens:    tokens,
 		Credits:   credits,
@@ -1518,7 +1550,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1558,7 +1590,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", model, "", apiKeyID, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1934,7 +1966,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
-			h.recordFailureWithDetails("openai", model, account.ID, err)
+			h.recordFailureWithDetails("openai", model, account.ID, apiKeyID, err)
 			return
 		}
 
@@ -1965,7 +1997,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -2000,7 +2032,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", model, "", apiKeyID, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2070,7 +2102,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -2084,7 +2116,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", model, "", apiKeyID, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
