@@ -22,6 +22,17 @@ func TestCodexCallbackBindAddrs(t *testing.T) {
 	}
 }
 
+func TestCodexGenerateAuthURLUsesPercentEncodedScope(t *testing.T) {
+	signInURL := codexGenerateAuthURL("state", "challenge")
+	if strings.Contains(signInURL, "scope=openid+") {
+		t.Fatalf("sign-in URL encodes scope spaces with '+': %s", signInURL)
+	}
+	wantScope := "scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke"
+	if !strings.Contains(signInURL, wantScope) {
+		t.Fatalf("sign-in URL missing percent-encoded scope %q: %s", wantScope, signInURL)
+	}
+}
+
 func TestStartCodexLoginReusesActiveSession(t *testing.T) {
 	existing := &CodexSession{
 		ID:        "existing-session",

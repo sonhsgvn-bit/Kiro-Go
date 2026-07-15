@@ -41,19 +41,24 @@ type CodexTokenData struct {
 
 // codexGenerateAuthURL builds the authorization-code+PKCE URL to open in the browser.
 func codexGenerateAuthURL(state, challenge string) string {
-	params := url.Values{
-		"client_id":                  {codexClientID},
-		"response_type":              {"code"},
-		"redirect_uri":               {codexRedirectURI},
-		"scope":                      {codexScope},
-		"state":                      {state},
-		"code_challenge":             {challenge},
-		"code_challenge_method":      {"S256"},
-		"id_token_add_organizations": {"true"},
-		"codex_cli_simplified_flow":  {"true"},
-		"originator":                 {codexOriginator},
+	params := [][2]string{
+		{"response_type", "code"},
+		{"client_id", codexClientID},
+		{"redirect_uri", codexRedirectURI},
+		{"scope", codexScope},
+		{"code_challenge", challenge},
+		{"code_challenge_method", "S256"},
+		{"id_token_add_organizations", "true"},
+		{"codex_cli_simplified_flow", "true"},
+		{"state", state},
+		{"originator", codexOriginator},
 	}
-	return codexAuthURL + "?" + params.Encode()
+	query := make([]string, 0, len(params))
+	for _, param := range params {
+		value := strings.ReplaceAll(url.QueryEscape(param[1]), "+", "%20")
+		query = append(query, param[0]+"="+value)
+	}
+	return codexAuthURL + "?" + strings.Join(query, "&")
 }
 
 // exchangeCodexCode swaps an authorization code (+PKCE verifier) for tokens.

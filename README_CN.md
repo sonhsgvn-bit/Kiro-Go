@@ -16,7 +16,7 @@
 - 多账号池轮询负载均衡
 - 自动 Token 刷新、SSE 流式输出、Web 管理面板
 - 多种认证方式：AWS Builder ID、IAM Identity Center (企业 SSO)、SSO Token、本地缓存、凭证 JSON
-- 用量追踪、账号导入导出、中英双语
+- 用量追踪、账号导入导出、越英中三语（默认越南语）
 - 支持设置出站代理（SOCKS5 / HTTP）
 
 ## 快速开始

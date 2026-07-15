@@ -11,8 +11,10 @@
     localStorage.removeItem('admin_login_time');
   }
   let password = sessionStorage.getItem('admin_password') || localStorage.getItem('admin_password') || '';
-  let currentLang = localStorage.getItem('kiro_lang') || 'zh';
-  const dict = { en: null, zh: null };
+  const supportedLangs = ['vi', 'en', 'zh'];
+  const savedLang = localStorage.getItem('kiro_lang');
+  let currentLang = supportedLangs.includes(savedLang) ? savedLang : 'vi';
+  const dict = { vi: null, en: null, zh: null };
   let accountsData = [];
   const selectedAccounts = new Set();
   let filterKeyword = '';
@@ -109,7 +111,7 @@
   }
   function t(key, ...args) {
     const active = dict[currentLang] || {};
-    const fallback = dict.zh || {};
+    const fallback = dict.en || {};
     let text = active[key] || fallback[key] || key;
     args.forEach((arg, idx) => { text = text.replace('{' + idx + '}', arg); });
     return text;
@@ -3745,7 +3747,7 @@
   async function init() {
     initTheme();
     await loadLocale(currentLang);
-    if (currentLang !== 'zh') await loadLocale('zh');
+    if (currentLang !== 'en') await loadLocale('en');
     applyTranslations();
     initCustomSelectObserver();
     initPrivacyMode();
