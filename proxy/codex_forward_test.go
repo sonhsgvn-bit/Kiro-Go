@@ -52,3 +52,10 @@ func TestNormalizeCodexTestModel(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexSubscription(t *testing.T) {
+	subscriptionType, title := codexSubscription("plus")
+	if subscriptionType != "PLUS" || title != "ChatGPT Plus" {
+		t.Fatalf("subscription = (%q, %q)", subscriptionType, title)
+	}
+}

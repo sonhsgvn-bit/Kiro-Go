@@ -53,6 +53,7 @@ type CodexResult struct {
 	RefreshToken string
 	AccountID    string
 	Email        string
+	PlanType     string
 	ExpiresAt    int64
 }
 
@@ -175,6 +176,7 @@ func PollCodexAuth(sessionID string) (*CodexResult, string, error) {
 			RefreshToken: td.RefreshToken,
 			AccountID:    td.AccountID,
 			Email:        td.Email,
+			PlanType:     td.PlanType,
 			ExpiresAt:    td.ExpiresAt,
 		}, "completed", nil
 	default:
@@ -221,6 +223,7 @@ func CompleteCodexLogin(sessionID, callbackURL string) (*CodexResult, error) {
 		RefreshToken: td.RefreshToken,
 		AccountID:    td.AccountID,
 		Email:        td.Email,
+		PlanType:     td.PlanType,
 		ExpiresAt:    td.ExpiresAt,
 	}, nil
 }

@@ -141,6 +141,74 @@ func normalizeCodexTestModel(model string) string {
 	return model
 }
 
+func codexSubscription(planType string) (subscriptionType, subscriptionTitle string) {
+	switch strings.ToLower(strings.TrimSpace(planType)) {
+	case "free":
+		return "FREE", "ChatGPT Free"
+	case "plus":
+		return "PLUS", "ChatGPT Plus"
+	case "pro":
+		return "PRO", "ChatGPT Pro"
+	case "team":
+		return "TEAM", "ChatGPT Team"
+	case "business":
+		return "BUSINESS", "ChatGPT Business"
+	case "enterprise":
+		return "ENTERPRISE", "ChatGPT Enterprise"
+	default:
+		planType = strings.TrimSpace(planType)
+		if planType == "" {
+			return "", ""
+		}
+		return strings.ToUpper(planType), "ChatGPT " + planType
+	}
+}
+
+func (h *Handler) refreshCodexAccountToken(account *config.Account) error {
+	if account == nil || strings.TrimSpace(account.RefreshToken) == "" {
+		return fmt.Errorf("codex refresh requires a refresh token")
+	}
+	proxyURL := strings.TrimSpace(account.ProxyURL)
+	if proxyURL == "" {
+		proxyURL = config.GetProxyURL()
+	}
+	tokenData, err := auth.RefreshCodexTokenData(account.RefreshToken, auth.GetAuthClientForProxy(proxyURL))
+	if err != nil {
+		return err
+	}
+
+	account.AccessToken = tokenData.AccessToken
+	if tokenData.RefreshToken != "" {
+		account.RefreshToken = tokenData.RefreshToken
+	}
+	account.ExpiresAt = tokenData.ExpiresAt
+	if tokenData.Email != "" {
+		account.Email = tokenData.Email
+	}
+	if tokenData.AccountID != "" {
+		account.CodexAccountID = tokenData.AccountID
+	}
+	if subscriptionType, subscriptionTitle := codexSubscription(tokenData.PlanType); subscriptionType != "" {
+		account.SubscriptionType = subscriptionType
+		account.SubscriptionTitle = subscriptionTitle
+	}
+
+	if err := config.UpdateCodexAccountAuth(
+		account.ID,
+		account.AccessToken,
+		account.RefreshToken,
+		account.ExpiresAt,
+		account.Email,
+		account.CodexAccountID,
+		account.SubscriptionType,
+		account.SubscriptionTitle,
+	); err != nil {
+		return err
+	}
+	h.pool.Reload()
+	return nil
+}
+
 // testCodexAccount sends a minimal request to the ChatGPT backend to verify a
 // codex account works, and writes a JSON result. model may carry the routing
 // prefix or be empty; it is normalized to a real model name.
@@ -256,17 +324,20 @@ func (h *Handler) apiPollCodex(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{"status": status})
 		return
 	}
+	subscriptionType, subscriptionTitle := codexSubscription(result.PlanType)
 
 	account := config.Account{
-		ID:             auth.GenerateAccountID(),
-		Email:          result.Email,
-		AccessToken:    result.AccessToken,
-		RefreshToken:   result.RefreshToken,
-		CodexAccountID: result.AccountID,
-		AuthMethod:     "codex",
-		Provider:       "ChatGPT",
-		ExpiresAt:      result.ExpiresAt,
-		Enabled:        true,
+		ID:                auth.GenerateAccountID(),
+		Email:             result.Email,
+		AccessToken:       result.AccessToken,
+		RefreshToken:      result.RefreshToken,
+		CodexAccountID:    result.AccountID,
+		AuthMethod:        "codex",
+		Provider:          "ChatGPT",
+		SubscriptionType:  subscriptionType,
+		SubscriptionTitle: subscriptionTitle,
+		ExpiresAt:         result.ExpiresAt,
+		Enabled:           true,
 	}
 	if err := config.AddAccount(account); err != nil {
 		w.WriteHeader(500)
@@ -293,17 +364,20 @@ func (h *Handler) apiCompleteCodex(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+	subscriptionType, subscriptionTitle := codexSubscription(result.PlanType)
 
 	account := config.Account{
-		ID:             auth.GenerateAccountID(),
-		Email:          result.Email,
-		AccessToken:    result.AccessToken,
-		RefreshToken:   result.RefreshToken,
-		CodexAccountID: result.AccountID,
-		AuthMethod:     "codex",
-		Provider:       "ChatGPT",
-		ExpiresAt:      result.ExpiresAt,
-		Enabled:        true,
+		ID:                auth.GenerateAccountID(),
+		Email:             result.Email,
+		AccessToken:       result.AccessToken,
+		RefreshToken:      result.RefreshToken,
+		CodexAccountID:    result.AccountID,
+		AuthMethod:        "codex",
+		Provider:          "ChatGPT",
+		SubscriptionType:  subscriptionType,
+		SubscriptionTitle: subscriptionTitle,
+		ExpiresAt:         result.ExpiresAt,
+		Enabled:           true,
 	}
 	if err := config.AddAccount(account); err != nil {
 		w.WriteHeader(500)
@@ -311,6 +385,7 @@ func (h *Handler) apiCompleteCodex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.pool.Reload()
+	go h.refreshCodexModels(&account)
 	json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": account.ID})
 }
 
@@ -332,6 +407,12 @@ func (h *Handler) apiGetProviderModels(w http.ResponseWriter, r *http.Request) {
 		for _, acc := range h.pool.GetAllAccounts() {
 			if acc.AuthMethod == "codex" && acc.Enabled {
 				a := acc
+				if a.RefreshToken != "" {
+					if err := h.refreshCodexAccountToken(&a); err != nil {
+						refreshErrors = append(refreshErrors, err.Error())
+						continue
+					}
+				}
 				if err := h.refreshCodexModels(&a); err != nil {
 					refreshErrors = append(refreshErrors, err.Error())
 				}

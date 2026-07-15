@@ -310,10 +310,14 @@ func (h *Handler) refreshAllAccounts() {
 		if !account.Enabled || account.AccessToken == "" {
 			continue
 		}
-		// Codex (ChatGPT) accounts are not Kiro accounts: RefreshAccountInfo and
-		// token refresh below are AWS/Kiro APIs that would 403 a ChatGPT token and
-		// wrongly cooldown/ban it. They are refreshed via their own OAuth flow.
+		// Codex tokens use their own OAuth refresh and model catalog. Never send
+		// them through the Kiro account-info flow.
 		if account.AuthMethod == "codex" {
+			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+				if err := h.refreshCodexAccountToken(account); err != nil {
+					logger.Warnf("[BackgroundRefresh] Codex token refresh failed for %s: %v", account.Email, err)
+				}
+			}
 			continue
 		}
 
@@ -2252,6 +2256,9 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 			return nil
 		}
 	}
+	if account.AuthMethod == "codex" {
+		return h.refreshCodexAccountToken(account)
+	}
 
 	accessToken, refreshToken, expiresAt, profileArn, err := auth.RefreshToken(account)
 	if err != nil {
@@ -2802,17 +2809,15 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			// account. Refresh the OAuth token + re-discover models instead.
 			if account.AuthMethod == "codex" {
 				if account.RefreshToken != "" {
-					if newAccess, newRefresh, newExpires, _, err := auth.RefreshToken(account); err == nil {
-						account.AccessToken = newAccess
-						if newRefresh != "" {
-							account.RefreshToken = newRefresh
-						}
-						account.ExpiresAt = newExpires
-						config.UpdateAccountToken(id, newAccess, newRefresh, newExpires)
-						h.pool.UpdateToken(id, newAccess, newRefresh, newExpires)
+					if err := h.refreshCodexAccountToken(account); err != nil {
+						failCount++
+						continue
 					}
 				}
-				h.refreshCodexModels(account)
+				if err := h.refreshCodexModels(account); err != nil {
+					failCount++
+					continue
+				}
 				successCount++
 				continue
 			}
@@ -4042,12 +4047,18 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 	// AWS/Kiro API that would 403 a ChatGPT token. Refresh the OAuth token and
 	// re-discover the ChatGPT model catalog instead.
 	if account.AuthMethod == "codex" {
-		if err := refreshTokenIfNeeded(); err != nil {
+		if account.RefreshToken != "" {
+			if err := h.refreshCodexAccountToken(account); err != nil {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+				return
+			}
+		}
+		if err := h.refreshCodexModels(account); err != nil {
 			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+			json.NewEncoder(w).Encode(map[string]string{"error": "Model refresh failed: " + err.Error()})
 			return
 		}
-		h.refreshCodexModels(account)
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Codex account refreshed"})
 		return
 	}

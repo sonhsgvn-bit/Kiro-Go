@@ -36,6 +36,7 @@ type CodexTokenData struct {
 	RefreshToken string
 	AccountID    string
 	Email        string
+	PlanType     string
 	ExpiresAt    int64 // Unix seconds
 }
 
@@ -116,7 +117,17 @@ func codexTokenRequest(ctx context.Context, client *http.Client, data url.Values
 		return nil, fmt.Errorf("codex token response missing access_token")
 	}
 
-	accountID, email := parseCodexIDToken(tokenResp.IDToken)
+	accountID, email, planType := parseCodexIDToken(tokenResp.IDToken)
+	accessAccountID, accessEmail, accessPlanType := parseCodexIDToken(tokenResp.AccessToken)
+	if accountID == "" {
+		accountID = accessAccountID
+	}
+	if email == "" {
+		email = accessEmail
+	}
+	if planType == "" {
+		planType = accessPlanType
+	}
 	expiresIn := tokenResp.ExpiresIn
 	if expiresIn <= 0 {
 		expiresIn = 3600
@@ -127,44 +138,62 @@ func codexTokenRequest(ctx context.Context, client *http.Client, data url.Values
 		RefreshToken: tokenResp.RefreshToken,
 		AccountID:    accountID,
 		Email:        email,
+		PlanType:     planType,
 		ExpiresAt:    time.Now().Add(time.Duration(expiresIn) * time.Second).Unix(),
 	}, nil
+}
+
+// RefreshCodexTokenData refreshes a Codex token and preserves the account
+// metadata carried by the returned ID/access token claims.
+func RefreshCodexTokenData(refreshToken string, client *http.Client) (*CodexTokenData, error) {
+	if refreshToken == "" {
+		return nil, fmt.Errorf("codex refresh requires a refresh token")
+	}
+	return refreshCodexTokenRequest(context.Background(), client, refreshToken)
 }
 
 // RefreshCodexToken refreshes a Codex access token. Returns access token,
 // refresh token (may be empty if unchanged), and expiry (Unix seconds).
 func RefreshCodexToken(refreshToken string, client *http.Client) (string, string, int64, error) {
-	if refreshToken == "" {
-		return "", "", 0, fmt.Errorf("codex refresh requires a refresh token")
-	}
-	td, err := refreshCodexTokenRequest(context.Background(), client, refreshToken)
+	td, err := RefreshCodexTokenData(refreshToken, client)
 	if err != nil {
 		return "", "", 0, err
 	}
 	return td.AccessToken, td.RefreshToken, td.ExpiresAt, nil
 }
 
-// parseCodexIDToken extracts the ChatGPT account_id and email from the JWT
+// parseCodexIDToken extracts the ChatGPT account id, email, and plan from the JWT
 // id_token payload (no signature verification: used only to label the account).
-func parseCodexIDToken(idToken string) (accountID, email string) {
+func parseCodexIDToken(idToken string) (accountID, email, planType string) {
 	parts := strings.Split(strings.TrimSpace(idToken), ".")
 	if len(parts) < 2 {
-		return "", ""
+		return "", "", ""
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		if payload, err = base64.StdEncoding.DecodeString(parts[1]); err != nil {
-			return "", ""
+			return "", "", ""
 		}
 	}
 	var claims struct {
-		Email string `json:"email"`
-		Auth  struct {
+		Email     string `json:"email"`
+		AccountID string `json:"account_id"`
+		PlanType  string `json:"plan_type"`
+		Auth      struct {
 			ChatGPTAccountID string `json:"chatgpt_account_id"`
+			ChatGPTPlanType  string `json:"chatgpt_plan_type"`
 		} `json:"https://api.openai.com/auth"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return "", ""
+		return "", "", ""
 	}
-	return claims.Auth.ChatGPTAccountID, claims.Email
+	accountID = strings.TrimSpace(claims.Auth.ChatGPTAccountID)
+	if accountID == "" {
+		accountID = strings.TrimSpace(claims.AccountID)
+	}
+	planType = strings.TrimSpace(claims.Auth.ChatGPTPlanType)
+	if planType == "" {
+		planType = strings.TrimSpace(claims.PlanType)
+	}
+	return accountID, strings.TrimSpace(claims.Email), planType
 }

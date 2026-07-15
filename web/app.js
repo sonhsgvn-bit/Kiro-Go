@@ -856,6 +856,7 @@
     const s = (type || '').toUpperCase();
     if (s.includes('POWER')) return t('subscription.power');
     if (s.includes('PRO_PLUS') || s.includes('PROPLUS')) return t('subscription.proPlus');
+    if (s.includes('PLUS')) return t('subscription.plus');
     if (s.includes('PRO')) return t('subscription.pro');
     if (s.includes('FREE')) return t('subscription.free');
     return type || t('subscription.free');
@@ -864,6 +865,7 @@
     const s = (type || '').toUpperCase();
     if (s.includes('POWER')) return '<span class="badge badge-power">' + escapeHtml(formatSubscriptionLabel(type)) + '</span>';
     if (s.includes('PRO_PLUS') || s.includes('PROPLUS')) return '<span class="badge badge-proplus">' + escapeHtml(formatSubscriptionLabel(type)) + '</span>';
+    if (s.includes('PLUS')) return '<span class="badge badge-pro">' + escapeHtml(formatSubscriptionLabel(type)) + '</span>';
     if (s.includes('PRO')) return '<span class="badge badge-pro">' + escapeHtml(formatSubscriptionLabel(type)) + '</span>';
     return '<span class="badge badge-free">' + escapeHtml(formatSubscriptionLabel(type)) + '</span>';
   }
@@ -1814,6 +1816,7 @@
       const res = await api(url);
       const d = await res.json();
       if (!res.ok || d.error) throw new Error(d.error || t('detail.loadFailed'));
+      if (d.warning) toast(d.warning, 'warning');
       const models = d.models || [];
       const custom = new Set((d.custom || []).map(m => m.toLowerCase()));
       if (models.length === 0) {
@@ -1828,7 +1831,7 @@
           '</div>';
       }).join('');
     } catch (e) {
-      c.innerHTML = '<p class="message message-error">' + escapeHtml(t('detail.loadFailed')) + '</p>';
+      c.innerHTML = '<p class="message message-error">' + escapeHtml(e.message || t('detail.loadFailed')) + '</p>';
     }
   }
   async function addCustomModel(provider) {

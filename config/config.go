@@ -645,6 +645,34 @@ func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) e
 	return nil
 }
 
+// UpdateCodexAccountAuth persists refreshed ChatGPT credentials and the
+// subscription metadata carried in the OAuth token claims.
+func UpdateCodexAccountAuth(id, accessToken, refreshToken string, expiresAt int64, email, codexAccountID, subscriptionType, subscriptionTitle string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].AccessToken = accessToken
+			if refreshToken != "" {
+				cfg.Accounts[i].RefreshToken = refreshToken
+			}
+			cfg.Accounts[i].ExpiresAt = expiresAt
+			if email != "" {
+				cfg.Accounts[i].Email = email
+			}
+			if codexAccountID != "" {
+				cfg.Accounts[i].CodexAccountID = codexAccountID
+			}
+			if subscriptionType != "" {
+				cfg.Accounts[i].SubscriptionType = subscriptionType
+				cfg.Accounts[i].SubscriptionTitle = subscriptionTitle
+			}
+			return Save()
+		}
+	}
+	return nil
+}
+
 func GetApiKey() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
