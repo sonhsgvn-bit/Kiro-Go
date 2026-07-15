@@ -1,8 +1,11 @@
 package auth
 
 import (
+	"errors"
+	"net"
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -93,4 +96,36 @@ func TestReusableCodexSessionRemovesExpired(t *testing.T) {
 	if exists {
 		t.Fatalf("expired session was not removed")
 	}
+}
+
+func TestStartCodexLoginFallsBackToManualCallback(t *testing.T) {
+	codexSessionsMu.Lock()
+	previousSessions := codexSessions
+	codexSessions = make(map[string]*CodexSession)
+	codexSessionsMu.Unlock()
+	previousListen := codexListen
+	previousProxyURL := codexProxyURL
+	codexListen = func(_, _ string) (net.Listener, error) {
+		return nil, errors.New("port busy")
+	}
+	codexProxyURL = func() string { return "" }
+	t.Cleanup(func() {
+		codexListen = previousListen
+		codexProxyURL = previousProxyURL
+		codexSessionsMu.Lock()
+		codexSessions = previousSessions
+		codexSessionsMu.Unlock()
+	})
+
+	session, signInURL, err := StartCodexLogin()
+	if err != nil {
+		t.Fatalf("StartCodexLogin returned fatal listener error: %v", err)
+	}
+	if session == nil || signInURL == "" {
+		t.Fatalf("manual fallback did not return a usable login session")
+	}
+	if !strings.Contains(session.ListenerError, "port busy") {
+		t.Fatalf("listener error = %q, want port busy", session.ListenerError)
+	}
+	CancelCodexLogin(session.ID)
 }

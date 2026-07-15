@@ -2973,6 +2973,8 @@
     $('codexStep1').classList.add('hidden');
     $('codexStep2').classList.remove('hidden');
     $('codexSignInUrl').textContent = d.signInUrl;
+	$('codexStatus').textContent = d.manualRequired ? t('codex.manualRequired') : t('builderid.waiting');
+	if (d.manualRequired) toast(t('codex.manualRequired'), 'warning');
     $('codexOpenBtn').addEventListener('click', () => window.open(d.signInUrl, '_blank'));
     $('codexCopyBtn').addEventListener('click', () => { navigator.clipboard.writeText(d.signInUrl); toast(t('common.copied'), 'success'); });
     $('codexCancelBtn').addEventListener('click', cancelCodexLogin);

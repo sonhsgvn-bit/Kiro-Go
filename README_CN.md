@@ -123,7 +123,7 @@ ssh -N -o ExitOnForwardFailure=yes \
 
 ChatGPT OAuth 的回调地址固定为 `http://localhost:1455/auth/callback`。远程登录有两种完成方式：
 
-1. **手动回调：** 登录完成后，从浏览器地址栏复制完整的 `http://localhost:1455/auth/callback?...` URL，粘贴到管理面板的回调输入框，然后点击 **Complete**。此方式不需要 SSH 隧道。
+1. **手动回调：** 登录完成后，从浏览器地址栏复制完整的 `http://localhost:1455/auth/callback?...` URL，粘贴到管理面板的回调输入框，然后点击 **Complete**。此方式不需要 SSH 隧道。如果端口 `1455` 已被占用，Start Login 会自动回退到该模式，而不会直接失败。
 2. **SSH 隧道：** 在浏览器电脑执行以下命令，并在登录期间保持会话开启：
 
 ```bash

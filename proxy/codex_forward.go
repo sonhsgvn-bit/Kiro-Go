@@ -216,9 +216,11 @@ func (h *Handler) apiStartCodex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"sessionId": session.ID,
-		"signInUrl": signInURL,
-		"interval":  2,
+		"sessionId":      session.ID,
+		"signInUrl":      signInURL,
+		"interval":       2,
+		"manualRequired": session.ListenerError != "",
+		"callbackError":  session.ListenerError,
 	})
 }
 
@@ -548,9 +550,9 @@ func (h *Handler) handleCodexResponses(w http.ResponseWriter, r *http.Request, r
 
 // codexResponsesInputItem is one item in the ChatGPT Responses "input" array.
 type codexResponsesInputItem struct {
-	Type    string                    `json:"type"`
-	Role    string                    `json:"role,omitempty"`
-	Content []codexResponsesContent   `json:"content,omitempty"`
+	Type    string                  `json:"type"`
+	Role    string                  `json:"role,omitempty"`
+	Content []codexResponsesContent `json:"content,omitempty"`
 }
 
 type codexResponsesContent struct {
@@ -574,8 +576,8 @@ func chatMessagesToCodexInput(messages []OpenAIMessage) []codexResponsesInputIte
 			contentType = "output_text"
 		}
 		items = append(items, codexResponsesInputItem{
-			Type: "message",
-			Role: role,
+			Type:    "message",
+			Role:    role,
 			Content: []codexResponsesContent{{Type: contentType, Text: text}},
 		})
 	}
@@ -739,9 +741,9 @@ func (h *Handler) collectCodexAsChatCompletion(w http.ResponseWriter, upstream i
 	}
 	content := sb.String()
 	out := map[string]interface{}{
-		"id":      "chatcmpl-" + uuid.New().String(),
-		"object":  "chat.completion",
-		"model":   model,
+		"id":     "chatcmpl-" + uuid.New().String(),
+		"object": "chat.completion",
+		"model":  model,
 		"choices": []map[string]interface{}{{
 			"index":         0,
 			"message":       map[string]interface{}{"role": "assistant", "content": content},

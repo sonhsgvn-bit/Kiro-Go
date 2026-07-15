@@ -257,6 +257,7 @@
   "codex.openInstruction": "Open the link below to sign in with ChatGPT. It will redirect back automatically.",
   "codex.callbackLabel": "Callback URL (manual)",
   "codex.callbackHint": "VPS login without a tunnel: after sign-in redirects to localhost:1455, copy the full URL from the browser address bar, paste it here, and click Complete.",
+  "codex.manualRequired": "Port 1455 is unavailable. Continue with login, then copy the localhost callback URL into the manual callback field below.",
   "codex.callbackRequired": "Paste the callback URL or code first",
   "codex.complete": "Complete",
   "codex.success": "ChatGPT account added",

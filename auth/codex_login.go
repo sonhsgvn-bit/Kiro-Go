@@ -27,11 +27,12 @@ const codexLoginTimeout = 10 * time.Minute
 
 // CodexSession holds the transient state for one Codex sign-in attempt.
 type CodexSession struct {
-	ID        string
-	Verifier  string
-	State     string
-	ProxyURL  string
-	ExpiresAt time.Time
+	ID            string
+	Verifier      string
+	State         string
+	ProxyURL      string
+	ExpiresAt     time.Time
+	ListenerError string
 
 	srv       *http.Server
 	resultCh  chan codexCapture
@@ -59,6 +60,8 @@ var (
 	codexSessions   = make(map[string]*CodexSession)
 	codexSessionsMu sync.RWMutex
 	codexStartMu    sync.Mutex
+	codexListen     = net.Listen
+	codexProxyURL   = config.GetProxyURL
 )
 
 // codexCallbackBindAddrs returns the address(es) the callback listener binds.
@@ -93,13 +96,17 @@ func StartCodexLogin() (*CodexSession, string, error) {
 		ID:        uuid.New().String(),
 		Verifier:  verifier,
 		State:     state,
-		ProxyURL:  config.GetProxyURL(),
+		ProxyURL:  codexProxyURL(),
 		ExpiresAt: now.Add(codexLoginTimeout),
 		resultCh:  make(chan codexCapture, 1),
 	}
 
 	if err := session.startListener(); err != nil {
-		return nil, "", err
+		// The admin UI supports pasting the final callback URL, so a loopback
+		// listener failure must not block remote/VPS login. Keep the PKCE session
+		// alive and let the operator finish through CompleteCodexLogin instead.
+		session.ListenerError = err.Error()
+		logger.Warnf("[Codex] %v; continuing with manual callback", err)
 	}
 
 	signInURL := codexGenerateAuthURL(state, challenge)
@@ -249,7 +256,7 @@ func CancelCodexLogin(sessionID string) {
 
 func (s *CodexSession) startListener() error {
 	addrs := codexCallbackBindAddrs()
-	ln, err := net.Listen("tcp", addrs[0])
+	ln, err := codexListen("tcp", addrs[0])
 	if err != nil {
 		return fmt.Errorf("cannot bind %s for the Codex callback (is the port already in use?): %w", addrs[0], err)
 	}
@@ -267,7 +274,7 @@ func (s *CodexSession) startListener() error {
 	}
 	serve(ln)
 	for _, addr := range addrs[1:] {
-		if extra, errExtra := net.Listen("tcp", addr); errExtra == nil {
+		if extra, errExtra := codexListen("tcp", addr); errExtra == nil {
 			serve(extra)
 		} else {
 			logger.Debugf("[Codex] secondary callback bind %s skipped: %v", addr, errExtra)

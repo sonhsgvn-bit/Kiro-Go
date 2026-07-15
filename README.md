@@ -123,7 +123,7 @@ Then open `http://localhost:8080/admin` and start Enterprise SSO. The Compose an
 
 The ChatGPT OAuth redirect is fixed at `http://localhost:1455/auth/callback`. You can complete a remote login in either of these ways:
 
-1. **Manual callback:** finish signing in, copy the full `http://localhost:1455/auth/callback?...` URL from the browser address bar, paste it into the admin panel's callback field, and click **Complete**. This does not require an SSH tunnel.
+1. **Manual callback:** finish signing in, copy the full `http://localhost:1455/auth/callback?...` URL from the browser address bar, paste it into the admin panel's callback field, and click **Complete**. This does not require an SSH tunnel. If port `1455` is already occupied, Start Login automatically falls back to this mode instead of failing.
 2. **SSH tunnel:** run this on the browser computer and keep it open during login:
 
 ```bash

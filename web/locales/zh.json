@@ -257,6 +257,7 @@
   "codex.openInstruction": "打开下方链接用 ChatGPT 登录，登录后会自动重定向回来。",
   "codex.callbackLabel": "回调 URL（手动）",
   "codex.callbackHint": "VPS 无隧道登录：跳转到 localhost:1455 后，从浏览器地址栏复制完整 URL，粘贴到这里并点击 Complete。",
+  "codex.manualRequired": "端口 1455 不可用。请继续登录，然后把 localhost 回调 URL 复制到下方的手动回调输入框。",
   "codex.callbackRequired": "请先粘贴回调 URL 或 code",
   "codex.complete": "完成",
   "codex.success": "ChatGPT 账号已添加",
