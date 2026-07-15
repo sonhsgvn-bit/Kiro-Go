@@ -36,7 +36,11 @@ docker-compose up -d
 docker run -d \
   --name kiro-go \
   -p 8080:8080 \
+  -p 127.0.0.1:3128:3128 \
+  -p 127.0.0.1:1455:1455 \
   -e ADMIN_PASSWORD=your_secure_password \
+  -e KIRO_SSO_CALLBACK_BIND=0.0.0.0 \
+  -e CODEX_CALLBACK_BIND=0.0.0.0 \
   -v /path/to/data:/app/data \
   --restart unless-stopped \
   ghcr.io/zsecducna/kiro-go:latest
@@ -96,6 +100,45 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
+## Microsoft 365 SSO on a Remote VPS
+
+The Enterprise SSO redirect URI is fixed at `http://localhost:3128`. Here, `localhost` means the computer running your browser, not the VPS. Before starting Microsoft 365 login, run this command on the browser computer and keep it open until login completes:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 3128:127.0.0.1:3128 root@VPS_IP
+```
+
+If port `8080` is also private, forward both the admin panel and the callback:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 8080:127.0.0.1:8080 \
+  -L 3128:127.0.0.1:3128 root@VPS_IP
+```
+
+Then open `http://localhost:8080/admin` and start Enterprise SSO. The Compose and Docker Run examples publish VPS port `3128` on loopback only so the SSH tunnel can reach it without exposing the transient callback publicly. Publishing `3128` publicly does not replace the tunnel because the OAuth provider still redirects the browser to its own `localhost`.
+
+## ChatGPT / OpenAI Login on a Remote VPS
+
+The ChatGPT OAuth redirect is fixed at `http://localhost:1455/auth/callback`. You can complete a remote login in either of these ways:
+
+1. **Manual callback:** finish signing in, copy the full `http://localhost:1455/auth/callback?...` URL from the browser address bar, paste it into the admin panel's callback field, and click **Complete**. This does not require an SSH tunnel.
+2. **SSH tunnel:** run this on the browser computer and keep it open during login:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 1455:127.0.0.1:1455 root@VPS_IP
+```
+
+To forward both Kiro Enterprise SSO and ChatGPT OAuth in one session:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 3128:127.0.0.1:3128 \
+  -L 1455:127.0.0.1:1455 root@VPS_IP
+```
+
 ## Thinking Mode
 
 Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. Configure output format in the admin panel under Settings - Thinking Mode.
@@ -112,6 +155,8 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `KIRO_SSO_CALLBACK_BIND` | Enterprise SSO callback bind address; use `0.0.0.0` inside Docker with host port `3128` published on loopback | loopback only |
+| `CODEX_CALLBACK_BIND` | ChatGPT OAuth callback bind address; use `0.0.0.0` inside Docker with host port `1455` published on loopback | loopback only |
 
 ## Contributing
 

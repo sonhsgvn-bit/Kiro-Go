@@ -36,7 +36,11 @@ docker-compose up -d
 docker run -d \
   --name kiro-go \
   -p 8080:8080 \
+  -p 127.0.0.1:3128:3128 \
+  -p 127.0.0.1:1455:1455 \
   -e ADMIN_PASSWORD=your_secure_password \
+  -e KIRO_SSO_CALLBACK_BIND=0.0.0.0 \
+  -e CODEX_CALLBACK_BIND=0.0.0.0 \
   -v /path/to/data:/app/data \
   --restart unless-stopped \
   ghcr.io/zsecducna/kiro-go:latest
@@ -96,6 +100,45 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"你好！"}]}'
 ```
 
+## 在远程 VPS 上登录 Microsoft 365 SSO
+
+Enterprise SSO 的回调地址固定为 `http://localhost:3128`。这里的 `localhost` 指运行浏览器的电脑，而不是 VPS。开始 Microsoft 365 登录前，请在浏览器所在电脑执行以下命令，并保持 SSH 会话开启直到登录完成：
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 3128:127.0.0.1:3128 root@VPS_IP
+```
+
+如果 VPS 的 `8080` 端口也未公开，可以同时转发管理面板和 SSO 回调：
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 8080:127.0.0.1:8080 \
+  -L 3128:127.0.0.1:3128 root@VPS_IP
+```
+
+然后访问 `http://localhost:8080/admin` 并启动 Enterprise SSO。Compose 和 Docker Run 示例只把 VPS 的 `3128` 发布到回环地址，SSH 隧道可以访问该端口，同时避免把临时回调直接暴露到公网。仅把 `3128` 暴露到公网不能替代 SSH 隧道，因为 OAuth 仍然会把浏览器重定向到浏览器电脑自己的 `localhost`。
+
+## 在远程 VPS 上登录 ChatGPT / OpenAI
+
+ChatGPT OAuth 的回调地址固定为 `http://localhost:1455/auth/callback`。远程登录有两种完成方式：
+
+1. **手动回调：** 登录完成后，从浏览器地址栏复制完整的 `http://localhost:1455/auth/callback?...` URL，粘贴到管理面板的回调输入框，然后点击 **Complete**。此方式不需要 SSH 隧道。
+2. **SSH 隧道：** 在浏览器电脑执行以下命令，并在登录期间保持会话开启：
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 1455:127.0.0.1:1455 root@VPS_IP
+```
+
+也可以在同一个 SSH 会话中同时转发 Kiro Enterprise SSO 和 ChatGPT OAuth：
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 3128:127.0.0.1:3128 \
+  -L 1455:127.0.0.1:1455 root@VPS_IP
+```
+
 ## 思考模式
 
 在模型名后加后缀（默认 `-thinking`）即可启用，例如 `claude-sonnet-4.5-thinking`。Claude 兼容请求如果带有顶层 `thinking` 配置，例如 `{"type":"enabled","budget_tokens":2048}` 或 `{"type":"adaptive"}`，也会自动启用 thinking 模式。输出格式可在管理面板「设置 - Thinking 模式」中配置。
@@ -112,6 +155,8 @@ curl http://localhost:8080/v1/chat/completions \
 |-----|------|-------|
 | `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
 | `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
+| `KIRO_SSO_CALLBACK_BIND` | Enterprise SSO 回调监听地址；Docker 内使用 `0.0.0.0`，并只把宿主机 `3128` 发布到回环地址 | 仅回环地址 |
+| `CODEX_CALLBACK_BIND` | ChatGPT OAuth 回调监听地址；Docker 内使用 `0.0.0.0`，并只把宿主机 `1455` 发布到回环地址 | 仅回环地址 |
 
 ## 参与贡献
 

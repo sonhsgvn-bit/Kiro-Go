@@ -58,6 +58,7 @@ type CodexResult struct {
 var (
 	codexSessions   = make(map[string]*CodexSession)
 	codexSessionsMu sync.RWMutex
+	codexStartMu    sync.Mutex
 )
 
 // codexCallbackBindAddrs returns the address(es) the callback listener binds.
@@ -71,6 +72,19 @@ func codexCallbackBindAddrs() []string {
 
 // StartCodexLogin binds the loopback listener and returns the session + sign-in URL.
 func StartCodexLogin() (*CodexSession, string, error) {
+	// Port 1455 is fixed by the registered OAuth redirect, so only one callback
+	// listener can exist at a time. A browser refresh loses its client-side
+	// session id while the backend session remains alive; reuse that session
+	// instead of failing the next Start request with EADDRINUSE.
+	codexStartMu.Lock()
+	defer codexStartMu.Unlock()
+
+	now := time.Now()
+	if existing := reusableCodexSession(now); existing != nil {
+		challenge := generateCodeChallenge(existing.Verifier)
+		return existing, codexGenerateAuthURL(existing.State, challenge), nil
+	}
+
 	verifier := generateCodeVerifier()
 	challenge := generateCodeChallenge(verifier)
 	state := uuid.New().String()
@@ -80,7 +94,7 @@ func StartCodexLogin() (*CodexSession, string, error) {
 		Verifier:  verifier,
 		State:     state,
 		ProxyURL:  config.GetProxyURL(),
-		ExpiresAt: time.Now().Add(codexLoginTimeout),
+		ExpiresAt: now.Add(codexLoginTimeout),
 		resultCh:  make(chan codexCapture, 1),
 	}
 
@@ -100,6 +114,31 @@ func StartCodexLogin() (*CodexSession, string, error) {
 	})
 
 	return session, signInURL, nil
+}
+
+// reusableCodexSession returns the active singleton login session, cleaning up
+// any expired entries first. StartCodexLogin serializes calls around this helper.
+func reusableCodexSession(now time.Time) *CodexSession {
+	var active *CodexSession
+	var expired []*CodexSession
+
+	codexSessionsMu.Lock()
+	for id, session := range codexSessions {
+		if !now.Before(session.ExpiresAt) {
+			delete(codexSessions, id)
+			expired = append(expired, session)
+			continue
+		}
+		if active == nil {
+			active = session
+		}
+	}
+	codexSessionsMu.Unlock()
+
+	for _, session := range expired {
+		session.close()
+	}
+	return active
 }
 
 // PollCodexAuth reports login status: ("", "pending", nil) until the code is

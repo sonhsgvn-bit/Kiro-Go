@@ -25,6 +25,8 @@ RUN mkdir -p /app/data
 EXPOSE 8080
 # Enterprise SSO (Microsoft 365) loopback callback port — see docker-compose.yml.
 EXPOSE 3128
+# ChatGPT / Codex OAuth loopback callback port — see docker-compose.yml.
+EXPOSE 1455
 VOLUME /app/data
 
 CMD ["./kiro-go"]

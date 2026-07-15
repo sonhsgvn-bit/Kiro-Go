@@ -19,13 +19,14 @@ import (
 )
 
 const (
-	codexAuthURL     = "https://auth.openai.com/oauth/authorize"
-	codexTokenURL    = "https://auth.openai.com/oauth/token"
-	codexClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
-	codexRedirectURI = "http://localhost:1455/auth/callback"
+	codexAuthURL      = "https://auth.openai.com/oauth/authorize"
+	codexTokenURL     = "https://auth.openai.com/oauth/token"
+	codexClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
+	codexRedirectURI  = "http://localhost:1455/auth/callback"
 	codexRedirectPort = "1455"
 	codexCallbackPath = "/auth/callback"
-	codexScope        = "openid email profile offline_access"
+	codexScope        = "openid profile email offline_access api.connectors.read api.connectors.invoke"
+	codexOriginator   = "codex_cli_rs"
 )
 
 // CodexTokenData is the resolved credential from an OAuth exchange or refresh.
@@ -48,9 +49,9 @@ func codexGenerateAuthURL(state, challenge string) string {
 		"state":                      {state},
 		"code_challenge":             {challenge},
 		"code_challenge_method":      {"S256"},
-		"prompt":                     {"login"},
 		"id_token_add_organizations": {"true"},
 		"codex_cli_simplified_flow":  {"true"},
+		"originator":                 {codexOriginator},
 	}
 	return codexAuthURL + "?" + params.Encode()
 }

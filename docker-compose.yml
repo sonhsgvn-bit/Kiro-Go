@@ -11,6 +11,10 @@ services:
       # the callback off the host's external interfaces while still letting the
       # host browser's localhost:3128 reach the container listener below.
       - "127.0.0.1:3128:3128"
+      # ChatGPT / Codex OAuth callback. Like the Kiro SSO callback, the OAuth
+      # redirect targets the browser machine's localhost, so remote operators
+      # can forward this loopback-only host port over SSH.
+      - "127.0.0.1:1455:1455"
     volumes:
       - ./data:/app/data
     environment:
@@ -24,4 +28,7 @@ services:
       # network during that window; on a shared/untrusted Docker network, pin
       # KIRO_SSO_CALLBACK_BIND to a specific interface or isolate the network.
       - KIRO_SSO_CALLBACK_BIND=0.0.0.0
+      # Allow the host-side 127.0.0.1:1455 publish above to reach the callback
+      # listener inside the container. State + PKCE protect the transient flow.
+      - CODEX_CALLBACK_BIND=0.0.0.0
     restart: unless-stopped
