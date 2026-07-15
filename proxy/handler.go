@@ -711,8 +711,7 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	// Codex (ChatGPT) accounts use the ChatGPT model catalog, not Kiro's
 	// ListAvailableModels; discover them separately (see refreshCodexModels).
 	if account.AuthMethod == "codex" {
-		h.refreshCodexModels(account)
-		return nil
+		return h.refreshCodexModels(account)
 	}
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
@@ -778,10 +777,22 @@ func (h *Handler) apiRefreshAllAccountsModels(w http.ResponseWriter, r *http.Req
 	h.modelsCacheMu.RLock()
 	cachedLen := len(h.cachedModels)
 	h.modelsCacheMu.RUnlock()
+	failed := 0
+	for _, account := range h.pool.GetAllAccounts() {
+		if account.AuthMethod != "codex" || !account.Enabled {
+			continue
+		}
+		a := account
+		if err := h.refreshCodexModels(&a); err != nil {
+			failed++
+			continue
+		}
+		cachedLen += len(h.pool.GetModelList(account.ID))
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":   true,
 		"refreshed": cachedLen,
-		"failed":    0,
+		"failed":    failed,
 	})
 }
 

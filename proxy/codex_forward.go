@@ -88,42 +88,57 @@ func (h *Handler) discoverCodexModels(account *config.Account) ([]string, error)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("codex models HTTP %d: %s", resp.StatusCode, string(body))
 	}
+	return parseCodexModelIDs(body)
+}
 
+func parseCodexModelIDs(body []byte) ([]string, error) {
 	var out struct {
 		Models []struct {
-			Slug           string `json:"slug"`
-			ID             string `json:"id"`
-			SupportedInAPI *bool  `json:"supported_in_api"`
+			Slug string `json:"slug"`
+			ID   string `json:"id"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, fmt.Errorf("parse codex models: %w", err)
 	}
 	ids := make([]string, 0, len(out.Models))
+	seen := make(map[string]bool, len(out.Models))
 	for _, m := range out.Models {
-		if m.SupportedInAPI != nil && !*m.SupportedInAPI {
-			continue
-		}
 		id := strings.TrimSpace(m.Slug)
 		if id == "" {
 			id = strings.TrimSpace(m.ID)
 		}
-		if id != "" {
+		key := strings.ToLower(id)
+		if id != "" && !seen[key] {
+			seen[key] = true
 			ids = append(ids, id)
 		}
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("codex model catalog returned no usable models")
 	}
 	return ids, nil
 }
 
 // refreshCodexModels discovers and caches the model list for one codex account.
-func (h *Handler) refreshCodexModels(account *config.Account) {
+func (h *Handler) refreshCodexModels(account *config.Account) error {
 	ids, err := h.discoverCodexModels(account)
 	if err != nil {
 		logger.Warnf("[Codex] model discovery failed for %s: %v", accountEmailForLog(account), err)
-		return
+		return err
 	}
 	h.pool.SetModelList(account.ID, ids)
 	logger.Infof("[Codex] discovered %d models for %s", len(ids), accountEmailForLog(account))
+	return nil
+}
+
+func normalizeCodexTestModel(model string) string {
+	model = strings.TrimSpace(model)
+	prefix, rest := splitProviderPrefix(model)
+	if strings.TrimSpace(prefix) != "" && strings.TrimSpace(rest) != "" {
+		return strings.TrimSpace(rest)
+	}
+	return model
 }
 
 // testCodexAccount sends a minimal request to the ChatGPT backend to verify a
@@ -137,10 +152,7 @@ func (h *Handler) testCodexAccount(w http.ResponseWriter, account *config.Accoun
 	}
 	// Normalize model: strip the codex prefix if present, else pick the first
 	// discovered model, else a sensible default.
-	realModel := strings.TrimSpace(model)
-	if isCodex, stripped := isCodexModel(realModel); isCodex {
-		realModel = stripped
-	}
+	realModel := normalizeCodexTestModel(model)
 	if realModel == "" {
 		if ids := h.pool.GetModelList(account.ID); len(ids) > 0 {
 			realModel = ids[0]
@@ -150,9 +162,11 @@ func (h *Handler) testCodexAccount(w http.ResponseWriter, account *config.Accoun
 	}
 
 	payload := map[string]interface{}{
-		"model":  realModel,
-		"input":  []codexResponsesInputItem{{Type: "message", Role: "user", Content: []codexResponsesContent{{Type: "input_text", Text: "say ok"}}}},
-		"stream": true,
+		"model":        realModel,
+		"input":        []codexResponsesInputItem{{Type: "message", Role: "user", Content: []codexResponsesContent{{Type: "input_text", Text: "say ok"}}}},
+		"instructions": "Reply with exactly: ok",
+		"store":        false,
+		"stream":       true,
 	}
 	body, _ := json.Marshal(payload)
 
@@ -312,13 +326,19 @@ func (h *Handler) apiGetProviderModels(w http.ResponseWriter, r *http.Request) {
 	// For codex, "Load All" (refresh=1) queries the ChatGPT model catalog live per
 	// account and caches it, so the list reflects real entitlements rather than a
 	// stale cache. Kiro discovery is driven by the existing models-cache path.
-	if provider == "codex" && strings.TrimSpace(r.URL.Query().Get("refresh")) != "" {
+	refresh := strings.TrimSpace(r.URL.Query().Get("refresh")) != ""
+	var refreshErrors []string
+	if provider == "codex" && refresh {
 		for _, acc := range h.pool.GetAllAccounts() {
 			if acc.AuthMethod == "codex" && acc.Enabled {
 				a := acc
-				h.refreshCodexModels(&a)
+				if err := h.refreshCodexModels(&a); err != nil {
+					refreshErrors = append(refreshErrors, err.Error())
+				}
 			}
 		}
+	} else if provider == "kiro" && refresh {
+		h.refreshModelsCache()
 	}
 
 	seen := map[string]bool{}
@@ -346,11 +366,22 @@ func (h *Handler) apiGetProviderModels(w http.ResponseWriter, r *http.Request) {
 		add(m)
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if len(models) == 0 && len(refreshErrors) > 0 {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": strings.Join(refreshErrors, "; "),
+		})
+		return
+	}
+	response := map[string]interface{}{
 		"provider": provider,
 		"models":   models,
 		"custom":   custom,
-	})
+	}
+	if len(refreshErrors) > 0 {
+		response["warning"] = strings.Join(refreshErrors, "; ")
+	}
+	json.NewEncoder(w).Encode(response)
 }
 
 // apiAddProviderModel adds a custom model id to a provider's list.
@@ -451,6 +482,21 @@ func isCodexModel(model string) (bool, string) {
 	return false, model
 }
 
+func prepareCodexResponsesPayload(rawBody []byte, realModel string) ([]byte, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(rawBody, &payload); err != nil {
+		return nil, err
+	}
+	model, _ := json.Marshal(realModel)
+	store, _ := json.Marshal(false)
+	stream, _ := json.Marshal(true)
+	payload["model"] = model
+	payload["store"] = store
+	payload["stream"] = stream
+	delete(payload, "previous_response_id")
+	return json.Marshal(payload)
+}
+
 // selectCodexAccount returns the next enabled codex account from the pool, or
 // nil if none is configured.
 func (h *Handler) selectCodexAccount() *config.Account {
@@ -477,16 +523,11 @@ func (h *Handler) handleCodexResponses(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	// Rewrite the model field to the real (prefix-stripped) model.
-	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(rawBody, &payload); err != nil {
+	body, err := prepareCodexResponsesPayload(rawBody, realModel)
+	if err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
-	if mb, err := json.Marshal(realModel); err == nil {
-		payload["model"] = mb
-	}
-	body, _ := json.Marshal(payload)
 
 	// Attach the inbound request context so a client disconnect cancels the
 	// upstream call instead of leaving it running.
@@ -621,6 +662,7 @@ func (h *Handler) handleCodexChat(w http.ResponseWriter, r *http.Request, req *O
 	payload := map[string]interface{}{
 		"model":  realModel,
 		"input":  chatMessagesToCodexInput(req.Messages),
+		"store":  false,
 		"stream": true,
 	}
 	body, _ := json.Marshal(payload)
@@ -819,6 +861,7 @@ func (h *Handler) handleCodexClaude(w http.ResponseWriter, r *http.Request, req 
 	payload := map[string]interface{}{
 		"model":  realModel,
 		"input":  claudeMessagesToCodexInput(req),
+		"store":  false,
 		"stream": true,
 	}
 	body, _ := json.Marshal(payload)

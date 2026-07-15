@@ -1804,14 +1804,16 @@
     row.appendChild(del);
     list.appendChild(row);
   }
-  async function loadProviderModels(provider) {
+  async function loadProviderModels(provider, refresh) {
     const listId = provider === 'codex' ? 'codexModelsList' : 'kiroModelsList';
     const c = $(listId);
     if (!c) return;
     c.innerHTML = '<p class="empty-state">' + escapeHtml(t('detail.loading')) + '</p>';
     try {
-      const res = await api('/provider-models?provider=' + encodeURIComponent(provider));
+      const url = '/provider-models?provider=' + encodeURIComponent(provider) + (refresh ? '&refresh=1' : '');
+      const res = await api(url);
       const d = await res.json();
+      if (!res.ok || d.error) throw new Error(d.error || t('detail.loadFailed'));
       const models = d.models || [];
       const custom = new Set((d.custom || []).map(m => m.toLowerCase()));
       if (models.length === 0) {
@@ -3374,9 +3376,9 @@
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
     $('addCodexBtn').addEventListener('click', () => showModal('codex'));
     $('codexAssignProxyBtn').addEventListener('click', assignProxiesToSelected);
-    $('kiroModelsLoadBtn').addEventListener('click', () => loadProviderModels('kiro'));
+    $('kiroModelsLoadBtn').addEventListener('click', () => loadProviderModels('kiro', true));
     $('kiroModelsAddBtn').addEventListener('click', () => addCustomModel('kiro'));
-    $('codexModelsLoadBtn').addEventListener('click', () => loadProviderModels('codex'));
+    $('codexModelsLoadBtn').addEventListener('click', () => loadProviderModels('codex', true));
     $('codexModelsAddBtn').addEventListener('click', () => addCustomModel('codex'));
 
     $('selectAllCheckbox').addEventListener('change', e => toggleSelectAll(e.target.checked));
