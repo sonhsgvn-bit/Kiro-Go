@@ -5,10 +5,14 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/auth"
+	"kiro-go/bot"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"net/http"
+	neturl "net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,6 +62,9 @@ type Handler struct {
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
+	// Telegram sales bot (nil until initialized in NewHandler)
+	bot      *bot.Bot
+	botStore *bot.Store
 }
 
 type thinkingStreamSource int
@@ -252,7 +259,26 @@ func NewHandler() *Handler {
 	go h.backgroundStatsSaver()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
+
+	// Initialize the Telegram sales bot. The store is always created so the
+	// admin API can read orders; the bot only polls when enabled + configured.
+	if store, err := bot.NewStore(botOrdersPath()); err != nil {
+		logger.Warnf("[Bot] failed to load orders store: %v", err)
+	} else {
+		h.botStore = store
+		h.bot = bot.New(store, mintPaidApiKey)
+		h.bot.Start()
+	}
 	return h
+}
+
+// botOrdersPath returns the path to the bot orders file, alongside config.json.
+func botOrdersPath() string {
+	configPath := "data/config.json"
+	if envPath := os.Getenv("CONFIG_PATH"); envPath != "" {
+		configPath = envPath
+	}
+	return filepath.Join(filepath.Dir(configPath), "bot_orders.json")
 }
 
 // backgroundRefresh 后台定时刷新账户信息
@@ -284,9 +310,16 @@ func (h *Handler) refreshAllAccounts() {
 		if !account.Enabled || account.AccessToken == "" {
 			continue
 		}
+		// Codex (ChatGPT) accounts are not Kiro accounts: RefreshAccountInfo and
+		// token refresh below are AWS/Kiro APIs that would 403 a ChatGPT token and
+		// wrongly cooldown/ban it. They are refreshed via their own OAuth flow.
+		if account.AuthMethod == "codex" {
+			continue
+		}
 
-		// 检查 token 是否需要刷新
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+		// API-key credentials have no OAuth refresh flow; skip refresh but still
+		// fetch account info below.
+		if !account.IsApiKeyCredential() && account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
 			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
 			if err != nil {
 				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
@@ -406,6 +439,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Write([]byte(`{"status":"ok"}`))
 
+	// Cryptomus 支付回调（公开端点，通过签名验证真实性）
+	case path == "/webhook/cryptomus" && r.Method == "POST":
+		h.handleCryptomusWebhook(w, r)
+
 	// 客户自助端点（用客户自己的 API Key 鉴权，只暴露该 Key 的数据）
 	case path == "/api/stats" && r.Method == "GET":
 		h.handleCustomerStats(w, r)
@@ -513,6 +550,30 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		buildModelInfo("gpt-4", "kiro-proxy", true),
 	)
 
+	// Advertise ChatGPT (Codex) models under the routing prefix so clients know
+	// which codex models exist (e.g. "gpt/gpt-5.6"). Discovered per-account models
+	// plus operator-added custom entries, deduped.
+	if prefix := strings.TrimSpace(config.GetCodexRoutePrefix()); prefix != "" {
+		seen := map[string]bool{}
+		for _, acc := range h.pool.GetAllAccounts() {
+			if acc.AuthMethod != "codex" {
+				continue
+			}
+			for _, m := range h.pool.GetModelList(acc.ID) {
+				if m = strings.TrimSpace(m); m != "" && !seen[strings.ToLower(m)] {
+					seen[strings.ToLower(m)] = true
+					models = append(models, buildModelInfo(prefix+"/"+m, "openai", false))
+				}
+			}
+		}
+		for _, m := range config.GetCustomModels("codex") {
+			if m = strings.TrimSpace(m); m != "" && !seen[strings.ToLower(m)] {
+				seen[strings.ToLower(m)] = true
+				models = append(models, buildModelInfo(prefix+"/"+m, "openai", false))
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "list",
@@ -610,6 +671,10 @@ func (h *Handler) refreshModelsCache() {
 	aggregated := make([]ModelInfo, 0)
 	for i := range accounts {
 		account := &accounts[i]
+		// Codex accounts use the ChatGPT model catalog, not Kiro ListAvailableModels.
+		if account.AuthMethod == "codex" {
+			continue
+		}
 		if err := h.ensureValidToken(account); err != nil {
 			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
 			h.handleAccountFailure(account, err)
@@ -643,6 +708,12 @@ func (h *Handler) refreshModelsCache() {
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
 // 同时更新 pool 的路由缓存与全局聚合模型列表。
 func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
+	// Codex (ChatGPT) accounts use the ChatGPT model catalog, not Kiro's
+	// ListAvailableModels; discover them separately (see refreshCodexModels).
+	if account.AuthMethod == "codex" {
+		h.refreshCodexModels(account)
+		return nil
+	}
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
@@ -844,6 +915,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		return
 	}
+
+	// Route to a ChatGPT (Codex) account when the model carries the codex prefix,
+	// so the Anthropic-compatible endpoint can serve codex models too.
+	if isCodex, realModel := isCodexModel(strings.TrimSpace(req.Model)); isCodex {
+		h.handleCodexClaude(w, r, &req, realModel, apiKeyIDFromContext(r.Context()))
+		return
+	}
+
 	if msg := validateClaudeRequestShape(&req); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
@@ -1624,6 +1703,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
+
+	// Route to a ChatGPT (Codex) account when the model carries the codex prefix.
+	if isCodex, realModel := isCodexModel(strings.TrimSpace(req.Model)); isCodex {
+		h.handleCodexChat(w, r, &req, realModel, apiKeyIDFromContext(r.Context()))
+		return
+	}
+
 	if msg := validateOpenAIRequestShape(&req); msg != "" {
 		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return
@@ -2133,6 +2219,11 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
+	// API-key credentials use the key directly as the bearer token and have no
+	// OAuth refresh flow, so never attempt to refresh them.
+	if account.IsApiKeyCredential() {
+		return nil
+	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
@@ -2224,6 +2315,12 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/cached") && r.Method == "GET":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/cached")
 		h.apiGetAccountModelsCached(w, r, id)
+	case path == "/provider-models" && r.Method == "GET":
+		h.apiGetProviderModels(w, r)
+	case path == "/provider-models" && r.Method == "POST":
+		h.apiAddProviderModel(w, r)
+	case path == "/provider-models" && r.Method == "DELETE":
+		h.apiRemoveProviderModel(w, r)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models") && r.Method == "GET":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models")
 		h.apiGetAccountModels(w, r, id)
@@ -2256,6 +2353,16 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiPollKiroSso(w, r)
 	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
 		h.apiCancelKiroSso(w, r)
+	case path == "/auth/codex/start" && r.Method == "POST":
+		h.apiStartCodex(w, r)
+	case path == "/auth/codex/poll" && r.Method == "POST":
+		h.apiPollCodex(w, r)
+	case path == "/auth/codex/complete" && r.Method == "POST":
+		h.apiCompleteCodex(w, r)
+	case path == "/auth/codex/cancel" && r.Method == "POST":
+		h.apiCancelCodex(w, r)
+	case path == "/codex-prefix" && r.Method == "POST":
+		h.apiUpdateCodexPrefix(w, r)
 	case path == "/auth/kiro-sso/select-profile" && r.Method == "POST":
 		h.apiSelectKiroSsoProfile(w, r)
 	case path == "/auth/sso-token" && r.Method == "POST":
@@ -2276,6 +2383,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetLogs(w, r)
 	case path == "/logs" && r.Method == "DELETE":
 		h.apiClearLogs(w, r)
+	case path == "/bot/config" && r.Method == "GET":
+		h.apiGetBotConfig(w, r)
+	case path == "/bot/config" && r.Method == "POST":
+		h.apiUpdateBotConfig(w, r)
+	case path == "/bot/orders" && r.Method == "GET":
+		h.apiListBotOrders(w, r)
+	case path == "/bot/stats" && r.Method == "GET":
+		h.apiBotStats(w, r)
 	case path == "/generate-machine-id" && r.Method == "GET":
 		h.apiGenerateMachineId(w, r)
 	case path == "/thinking" && r.Method == "GET":
@@ -2290,6 +2405,12 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetProxy(w, r)
 	case path == "/proxy" && r.Method == "POST":
 		h.apiUpdateProxy(w, r)
+	case path == "/proxy-pool" && r.Method == "GET":
+		h.apiGetProxyPool(w, r)
+	case path == "/proxy-pool" && r.Method == "POST":
+		h.apiUpdateProxyPool(w, r)
+	case path == "/accounts/assign-proxies" && r.Method == "POST":
+		h.apiAssignProxies(w, r)
 	case path == "/prompt-filter" && r.Method == "GET":
 		h.apiGetPromptFilter(w, r)
 	case path == "/prompt-filter" && r.Method == "POST":
@@ -2394,6 +2515,19 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		account.Region = "us-east-1"
 	}
 
+	// Handle API-key credential creation: the Kiro API key is used directly as
+	// the bearer token, so there is no OAuth token to refresh.
+	if account.KiroApiKey != "" || strings.EqualFold(account.AuthMethod, "api_key") || strings.EqualFold(account.AuthMethod, "apikey") {
+		if account.KiroApiKey == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
+			return
+		}
+		account.AuthMethod = "api_key"
+		account.ExpiresAt = 0
+		account.AccessToken = account.KiroApiKey // pool compatibility (treats a set AccessToken as usable)
+	}
+
 	if err := config.AddAccount(account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -2401,8 +2535,8 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.pool.Reload()
-	// 新账号若已启用且有 token，立即拉取并缓存模型列表
-	if account.Enabled && account.AccessToken != "" {
+	// 新账号若已启用且有 token（或是 API-key 账号），立即拉取并缓存模型列表
+	if account.Enabled && (account.AccessToken != "" || account.IsApiKeyCredential()) {
 		go func(acc config.Account) {
 			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", acc.Email, err)
@@ -2497,6 +2631,12 @@ func (h *Handler) apiGetAccountOverage(w http.ResponseWriter, r *http.Request, i
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
 		return
 	}
+	// Overage is a Kiro/AWS concept; it does not apply to Codex (ChatGPT) accounts
+	// and FetchOverageStatus would send a ChatGPT token to AWS (403).
+	if account.AuthMethod == "codex" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "notApplicable": true})
+		return
+	}
 
 	snap, err := FetchOverageStatus(account)
 	if err != nil {
@@ -2544,6 +2684,12 @@ func (h *Handler) apiSetAccountOverage(w http.ResponseWriter, r *http.Request, i
 	if account == nil {
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	// Overage does not apply to Codex (ChatGPT) accounts; SetOverageStatus would
+	// send a ChatGPT token to AWS (403).
+	if account.AuthMethod == "codex" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "notApplicable": true})
 		return
 	}
 
@@ -2637,6 +2783,26 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 			if account == nil {
 				failCount++
+				continue
+			}
+			// Codex (ChatGPT) accounts are not Kiro accounts: RefreshAccountInfo is
+			// an AWS/Kiro API that 403s a ChatGPT token, and RefreshAccountInfo
+			// auto-bans on that 403 — a bulk refresh would wrongly ban every codex
+			// account. Refresh the OAuth token + re-discover models instead.
+			if account.AuthMethod == "codex" {
+				if account.RefreshToken != "" {
+					if newAccess, newRefresh, newExpires, _, err := auth.RefreshToken(account); err == nil {
+						account.AccessToken = newAccess
+						if newRefresh != "" {
+							account.RefreshToken = newRefresh
+						}
+						account.ExpiresAt = newExpires
+						config.UpdateAccountToken(id, newAccess, newRefresh, newExpires)
+						h.pool.UpdateToken(id, newAccess, newRefresh, newExpires)
+					}
+				}
+				h.refreshCodexModels(account)
+				successCount++
 				continue
 			}
 			// 刷新 token
@@ -3619,11 +3785,12 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":         config.GetApiKey(),
-		"requireApiKey":  config.IsApiKeyRequired(),
-		"port":           config.GetPort(),
-		"host":           config.GetHost(),
-		"allowOverUsage": config.GetAllowOverUsage(),
+		"apiKey":           config.GetApiKey(),
+		"requireApiKey":    config.IsApiKeyRequired(),
+		"port":             config.GetPort(),
+		"host":             config.GetHost(),
+		"allowOverUsage":   config.GetAllowOverUsage(),
+		"codexRoutePrefix": config.GetCodexRoutePrefix(),
 	})
 }
 
@@ -3772,6 +3939,14 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		Model string `json:"model"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
+
+	// Codex (ChatGPT) accounts must be tested against the ChatGPT backend, not
+	// the Kiro data plane (CallKiroAPI would send a ChatGPT token to AWS).
+	if account.AuthMethod == "codex" {
+		h.testCodexAccount(w, account, req.Model)
+		return
+	}
+
 	if req.Model == "" {
 		req.Model = "claude-sonnet-4"
 	}
@@ -3850,6 +4025,20 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 			config.UpdateAccountProfileArn(id, profileArn)
 		}
 		return nil
+	}
+
+	// Codex (ChatGPT) accounts are not Kiro accounts: RefreshAccountInfo is an
+	// AWS/Kiro API that would 403 a ChatGPT token. Refresh the OAuth token and
+	// re-discover the ChatGPT model catalog instead.
+	if account.AuthMethod == "codex" {
+		if err := refreshTokenIfNeeded(); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+			return
+		}
+		h.refreshCodexModels(account)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Codex account refreshed"})
+		return
 	}
 
 	// 检查 token 是否快过期，先刷新
@@ -4010,6 +4199,18 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
+	// Codex (ChatGPT) accounts use the ChatGPT catalog, not Kiro ListAvailableModels.
+	if account.AuthMethod == "codex" {
+		h.refreshCodexModels(account)
+		ids := h.pool.GetModelList(id)
+		models := make([]ModelInfo, 0, len(ids))
+		for _, mid := range ids {
+			models = append(models, ModelInfo{ModelId: mid})
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models})
+		return
+	}
+
 	models, err := ListAvailableModels(account)
 	if err != nil {
 		w.WriteHeader(500)
@@ -4164,15 +4365,10 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 验证代理 URL 格式（非空时）
-	if req.ProxyURL != "" {
-		if !strings.HasPrefix(req.ProxyURL, "http://") &&
-			!strings.HasPrefix(req.ProxyURL, "https://") &&
-			!strings.HasPrefix(req.ProxyURL, "socks5://") &&
-			!strings.HasPrefix(req.ProxyURL, "socks5h://") {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
-			return
-		}
+	if req.ProxyURL != "" && !isValidProxyURL(req.ProxyURL) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+		return
 	}
 
 	if err := config.UpdateProxySettings(req.ProxyURL); err != nil {
@@ -4185,6 +4381,116 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	applyProxyConfig(req.ProxyURL)
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// isValidProxyURL reports whether u uses a supported outbound proxy scheme.
+func isValidProxyURL(u string) bool {
+	switch {
+	case strings.HasPrefix(u, "http://"),
+		strings.HasPrefix(u, "https://"),
+		strings.HasPrefix(u, "socks5://"),
+		strings.HasPrefix(u, "socks5h://"):
+	default:
+		return false
+	}
+	// Require a parseable URL with a non-empty host so "http://" or "socks5://@:"
+	// don't pass and get persisted/assigned as broken proxies.
+	parsed, err := neturl.Parse(u)
+	if err != nil {
+		return false
+	}
+	return parsed.Hostname() != ""
+}
+
+// apiGetProxyPool 返回代理池
+func (h *Handler) apiGetProxyPool(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string][]string{
+		"proxyPool": config.GetProxyPool(),
+	})
+}
+
+// apiUpdateProxyPool 更新代理池
+func (h *Handler) apiUpdateProxyPool(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ProxyPool []string `json:"proxyPool"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	pool := make([]string, 0, len(req.ProxyPool))
+	for _, p := range req.ProxyPool {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !isValidProxyURL(p) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid proxy URL: " + p + " (must start with http://, https://, socks5://, or socks5h://)"})
+			return
+		}
+		pool = append(pool, p)
+	}
+
+	if err := config.UpdateProxyPool(pool); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(pool)})
+}
+
+// apiAssignProxies 将代理按 round-robin 一一分配给选中的账号
+func (h *Handler) apiAssignProxies(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs     []string `json:"ids"`
+		Proxies []string `json:"proxies"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	proxies := make([]string, 0, len(req.Proxies))
+	for _, p := range req.Proxies {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !isValidProxyURL(p) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid proxy URL: " + p})
+			return
+		}
+		proxies = append(proxies, p)
+	}
+	if len(proxies) == 0 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no proxies provided"})
+		return
+	}
+	if len(req.IDs) == 0 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no accounts selected"})
+		return
+	}
+
+	// Set only the ProxyURL field per account (SetAccountProxy) to avoid clobbering
+	// concurrent token/stats updates that a full-record write would overwrite.
+	assigned := 0
+	for i, id := range req.IDs {
+		if err := config.SetAccountProxy(id, proxies[i%len(proxies)]); err != nil {
+			continue // account not found; skip
+		}
+		assigned++
+	}
+
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "assigned": assigned})
 }
 
 // apiGetVersion 获取版本信息

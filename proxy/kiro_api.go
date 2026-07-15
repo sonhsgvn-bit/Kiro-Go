@@ -374,6 +374,12 @@ func ensureRestProfileArn(account *config.Account) error {
 	if account == nil || strings.TrimSpace(account.ProfileArn) != "" {
 		return nil
 	}
+	// API-key credentials authenticate with the key directly and do not require a
+	// profileArn; ListAvailableProfiles typically returns empty for them and there
+	// is no refresh token to fall back on, so skip resolution and call with none.
+	if account.IsApiKeyCredential() {
+		return nil
+	}
 	profileArn, err := ResolveProfileArn(account)
 	if err != nil {
 		if isProfileArnResolutionSoftError(err) {

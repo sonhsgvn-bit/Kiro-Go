@@ -23,6 +23,8 @@
   let builderIdPollTimer = null;
   let kiroSsoSession = '';
   let kiroSsoPollTimer = null;
+  let codexSession = '';
+  let codexPollTimer = null;
   let iamSession = '';
   let exportSelectedIds = new Set();
   let currentVersion = '';
@@ -930,13 +932,30 @@
 
   function renderAccounts() {
     const container = $('accountsList');
+    const codexContainer = $('codexAccountsList');
     if (!container) return;
     const filtered = getFilteredAccounts();
-    if (filtered.length === 0) {
+    const kiroAccounts = filtered.filter(a => a.authMethod !== 'codex');
+    const codexAccounts = filtered.filter(a => a.authMethod === 'codex');
+
+    if (codexContainer) {
+      codexContainer.innerHTML = codexAccounts.length === 0
+        ? '<div class="empty-state">' + escapeHtml(t('accounts.codexEmpty')) + '</div>'
+        : codexAccounts.map(renderAccountCard).join('');
+      applyUsageBars(codexContainer);
+      enhanceCustomSelects(codexContainer);
+    }
+
+    if (kiroAccounts.length === 0) {
       container.innerHTML = '<div class="empty-state">' + escapeHtml(t('accounts.empty')) + '</div>';
       return;
     }
-    container.innerHTML = filtered.map(a => {
+    container.innerHTML = kiroAccounts.map(renderAccountCard).join('');
+    applyUsageBars(container);
+    enhanceCustomSelects(container);
+  }
+
+  function renderAccountCard(a) {
       const usagePct = (a.usagePercent || 0) * 100;
       const usageClass = usagePct > 90 ? 'critical' : usagePct > 70 ? 'high' : '';
       const trialPct = (a.trialUsagePercent || 0) * 100;
@@ -1007,9 +1026,6 @@
         '<div class="account-stat"><div class="account-stat-value">' + escapeHtml(formatTokenExpiry(a.expiresAt)) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.expiry')) + '</div></div>' +
         '</div>' +
         '</div>';
-    }).join('');
-    applyUsageBars(container);
-    enhanceCustomSelects(container);
   }
 
   // Opens the profile switcher for an existing external_idp account: fetches the
@@ -1590,7 +1606,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadProxyPool(), loadCodexPrefix(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1627,6 +1643,101 @@
     });
     const d = await res.json();
     if (d.success) toast(t('settings.endpointSaved'), 'success');
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  function botAddPackageRow(pkg) {
+    pkg = pkg || { id: '', label: '', credits: '', price: '' };
+    const list = $('botPackagesList');
+    if (!list) return;
+    const row = document.createElement('div');
+    row.className = 'input-row bot-package-row';
+    row.innerHTML =
+      '<input type="text" class="pkg-label" placeholder="' + escapeAttr(t('bot.pkgLabel')) + '" value="' + escapeAttr(pkg.label || '') + '" />' +
+      '<input type="number" class="pkg-credits w-24!" placeholder="' + escapeAttr(t('bot.pkgCredits')) + '" min="0" step="1" value="' + escapeAttr(pkg.credits != null ? String(pkg.credits) : '') + '" />' +
+      '<input type="number" class="pkg-price w-24!" placeholder="' + escapeAttr(t('bot.pkgPrice')) + '" min="0" step="0.01" value="' + escapeAttr(pkg.price != null ? String(pkg.price) : '') + '" />';
+    row.dataset.id = pkg.id || '';
+    const del = document.createElement('button');
+    del.className = 'btn btn-danger btn-xs';
+    del.textContent = '×';
+    del.onclick = () => row.remove();
+    row.appendChild(del);
+    list.appendChild(row);
+  }
+  async function loadBot() {
+    try {
+      const [cfgRes, statsRes] = await Promise.all([api('/bot/config'), api('/bot/stats')]);
+      const c = await cfgRes.json();
+      $('botEnabled').checked = !!c.enabled;
+      $('botTelegramToken').value = '';
+      $('botTelegramToken').placeholder = c.telegramTokenSet ? t('bot.secretUnchanged') : '';
+      $('botPublicBaseUrl').value = c.publicBaseUrl || '';
+      $('botCryptomusMerchantId').value = c.cryptomusMerchantId || '';
+      $('botCryptomusApiKey').value = '';
+      $('botCryptomusApiKey').placeholder = c.cryptomusApiKeySet ? t('bot.secretUnchanged') : '';
+      $('botPricePerCredit').value = c.pricePerCredit || '';
+      $('botMinCredits').value = c.minCredits || '';
+      const list = $('botPackagesList');
+      if (list) { list.innerHTML = ''; (c.packages || []).forEach(botAddPackageRow); }
+      const s = await statsRes.json();
+      renderBotStats(s);
+    } catch (e) { /* ignore */ }
+    loadBotOrders();
+  }
+  function renderBotStats(s) {
+    const el = $('botStatsSummary');
+    if (!el) return;
+    el.innerHTML =
+      '<span>' + escapeHtml(t('bot.statPaid')) + ': <b>' + (s.paidOrders || 0) + '</b>/' + (s.totalOrders || 0) + '</span>' +
+      '<span>' + escapeHtml(t('bot.statRevenue')) + ': <b>$' + (s.revenueUsd || 0).toFixed(2) + '</b></span>' +
+      '<span>' + escapeHtml(t('bot.statCredits')) + ': <b>' + (s.creditsSold || 0) + '</b></span>' +
+      '<span>' + escapeHtml(t('bot.statCustomers')) + ': <b>' + (s.customers || 0) + '</b></span>';
+  }
+  async function loadBotOrders() {
+    const el = $('botOrdersList');
+    if (!el) return;
+    try {
+      const res = await api('/bot/orders');
+      const d = await res.json();
+      const orders = d.orders || [];
+      if (orders.length === 0) { el.innerHTML = '<p class="text-muted">' + escapeHtml(t('bot.ordersEmpty')) + '</p>'; return; }
+      el.innerHTML = orders.map(o => {
+        const when = o.createdAt ? new Date(o.createdAt * 1000).toLocaleString() : '';
+        const who = o.telegramName ? '@' + escapeHtml(o.telegramName) : String(o.telegramId);
+        return '<div class="log-item log-' + (o.status === 'paid' ? 'success' : (o.status === 'failed' ? 'error' : 'info')) + '">' +
+          '<span>' + who + '</span> ' +
+          '<span>' + o.credits + ' credits</span> ' +
+          '<span>$' + (o.amountUsd || 0).toFixed(2) + '</span> ' +
+          '<span><b>' + escapeHtml(o.status) + '</b></span> ' +
+          (o.apiKeyMasked ? '<span class="font-mono">' + escapeHtml(o.apiKeyMasked) + '</span> ' : '') +
+          '<span class="text-muted">' + escapeHtml(when) + '</span>' +
+          '</div>';
+      }).join('');
+    } catch (e) { /* ignore */ }
+  }
+  async function saveBotConfig() {
+    const packages = [];
+    qsa('#botPackagesList .bot-package-row').forEach(row => {
+      const label = row.querySelector('.pkg-label').value.trim();
+      const credits = parseFloat(row.querySelector('.pkg-credits').value);
+      const price = parseFloat(row.querySelector('.pkg-price').value);
+      if (!label || !(credits > 0) || !(price > 0)) return;
+      packages.push({ id: row.dataset.id || ('pkg_' + Math.random().toString(36).slice(2, 8)), label, credits, price });
+    });
+    const body = {
+      enabled: $('botEnabled').checked,
+      cryptomusMerchantId: $('botCryptomusMerchantId').value.trim(),
+      publicBaseUrl: $('botPublicBaseUrl').value.trim(),
+      pricePerCredit: parseFloat($('botPricePerCredit').value) || 0,
+      minCredits: parseFloat($('botMinCredits').value) || 0,
+      packages
+    };
+    const tok = $('botTelegramToken').value.trim();
+    if (tok) body.telegramToken = tok;
+    const ck = $('botCryptomusApiKey').value.trim();
+    if (ck) body.cryptomusApiKey = ck;
+    const res = await api('/bot/config', { method: 'POST', body: JSON.stringify(body) });
+    const d = await res.json();
+    if (d.success) { toast(t('bot.configSaved'), 'success'); loadBot(); }
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
   async function loadProxyConfig() {
@@ -1672,6 +1783,120 @@
     const d = await res.json();
     if (d.success) toast(t('settings.proxySaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  function addProxyPoolRow(value) {
+    const list = $('proxyPoolList');
+    if (!list) return;
+    const row = document.createElement('div');
+    row.className = 'input-row proxy-pool-row';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'proxy-pool-input';
+    input.placeholder = 'socks5://user:pass@host:port';
+    input.value = value || '';
+    const del = document.createElement('button');
+    del.className = 'btn btn-danger btn-xs';
+    del.textContent = '×';
+    del.onclick = () => row.remove();
+    row.appendChild(input);
+    row.appendChild(del);
+    list.appendChild(row);
+  }
+  async function loadProviderModels(provider) {
+    const listId = provider === 'codex' ? 'codexModelsList' : 'kiroModelsList';
+    const c = $(listId);
+    if (!c) return;
+    c.innerHTML = '<p class="empty-state">' + escapeHtml(t('detail.loading')) + '</p>';
+    try {
+      const res = await api('/provider-models?provider=' + encodeURIComponent(provider));
+      const d = await res.json();
+      const models = d.models || [];
+      const custom = new Set((d.custom || []).map(m => m.toLowerCase()));
+      if (models.length === 0) {
+        c.innerHTML = '<p class="empty-state">' + escapeHtml(t('models.empty')) + '</p>';
+        return;
+      }
+      c.innerHTML = models.map(m => {
+        const isCustom = custom.has((m || '').toLowerCase());
+        return '<div class="model-item" style="display:flex;align-items:center;justify-content:space-between;gap:8px;">' +
+          '<span class="model-name">' + escapeHtml(m) + (isCustom ? ' <span class="badge badge-info">' + escapeHtml(t('models.customBadge')) + '</span>' : '') + '</span>' +
+          (isCustom ? '<button class="btn btn-xs btn-danger" data-model-remove="' + escapeAttr(m) + '" data-model-provider="' + escapeAttr(provider) + '">×</button>' : '') +
+          '</div>';
+      }).join('');
+    } catch (e) {
+      c.innerHTML = '<p class="message message-error">' + escapeHtml(t('detail.loadFailed')) + '</p>';
+    }
+  }
+  async function addCustomModel(provider) {
+    const model = prompt(t('models.addPrompt'));
+    if (!model || !model.trim()) return;
+    const res = await api('/provider-models', { method: 'POST', body: JSON.stringify({ provider, model: model.trim() }) });
+    const d = await res.json();
+    if (d.success) { toast(t('models.added'), 'success'); loadProviderModels(provider); }
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function removeCustomModel(provider, model) {
+    const res = await api('/provider-models', { method: 'DELETE', body: JSON.stringify({ provider, model }) });
+    const d = await res.json();
+    if (d.success) { toast(t('models.removed'), 'success'); loadProviderModels(provider); }
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function loadProxyPool() {
+    const list = $('proxyPoolList');
+    if (!list) return;
+    list.innerHTML = '';
+    try {
+      const res = await api('/proxy-pool');
+      const d = await res.json();
+      const pool = Array.isArray(d.proxyPool) ? d.proxyPool : [];
+      pool.forEach(p => addProxyPoolRow(p));
+    } catch (e) { /* ignore */ }
+  }
+  async function saveProxyPool() {
+    const inputs = document.querySelectorAll('#proxyPoolList .proxy-pool-input');
+    const proxyPool = [];
+    inputs.forEach(el => { const v = el.value.trim(); if (v) proxyPool.push(v); });
+    const res = await api('/proxy-pool', { method: 'POST', body: JSON.stringify({ proxyPool }) });
+    const d = await res.json();
+    if (d.success) toast(t('settings.proxyPoolSaved'), 'success');
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function loadCodexPrefix() {
+    const el = $('codexRoutePrefix');
+    if (!el) return;
+    try {
+      const res = await api('/settings');
+      const d = await res.json();
+      el.value = d.codexRoutePrefix || '';
+    } catch (e) { /* ignore */ }
+  }
+  async function saveCodexPrefix() {
+    const prefix = $('codexRoutePrefix').value.trim();
+    const res = await api('/codex-prefix', { method: 'POST', body: JSON.stringify({ codexRoutePrefix: prefix }) });
+    const d = await res.json();
+    if (d.success) toast(t('settings.codexPrefixSaved'), 'success');
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function assignProxiesToSelected() {
+    const ids = [...selectedAccounts];
+    if (ids.length === 0) { toast(t('batch.noneSelected'), 'warning'); return; }
+    let proxies = [];
+    try {
+      const res = await api('/proxy-pool');
+      const d = await res.json();
+      proxies = Array.isArray(d.proxyPool) ? d.proxyPool : [];
+    } catch (e) { /* ignore */ }
+    if (proxies.length === 0) { toast(t('accounts.proxyPoolEmpty'), 'warning'); return; }
+    if (!confirm(t('accounts.assignProxyConfirm', ids.length, proxies.length))) return;
+    const res = await api('/accounts/assign-proxies', { method: 'POST', body: JSON.stringify({ ids, proxies }) });
+    const d = await res.json();
+    if (d.success) {
+      toast(t('accounts.assignProxyDone', d.assigned), 'success');
+      selectedAccounts.clear();
+      await loadAccounts();
+    } else {
+      toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+    }
   }
   async function saveRequireApiKey() {
     try {
@@ -2078,7 +2303,9 @@
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
-    cookie: 'fa-solid fa-cookie-bite'
+    cookie: 'fa-solid fa-cookie-bite',
+    apikey: 'fa-solid fa-lock',
+    codex: 'fa-solid fa-robot'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -2103,6 +2330,8 @@
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
     else if (type === 'cookie') modalCookie(title, body);
+    else if (type === 'apikey') modalApiKey(title, body);
+    else if (type === 'codex') modalCodex(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -2119,6 +2348,11 @@
       api('/auth/kiro-sso/cancel', { method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession }) }).catch(() => {});
     }
     kiroSsoSession = '';
+    if (codexPollTimer) { clearTimeout(codexPollTimer); codexPollTimer = null; }
+    if (codexSession) {
+      api('/auth/codex/cancel', { method: 'POST', body: JSON.stringify({ sessionId: codexSession }) }).catch(() => {});
+    }
+    codexSession = '';
   }
   function modalAdd(title, body) {
     title.textContent = t('modal.addAccount');
@@ -2131,6 +2365,7 @@
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
+      methodCard('apikey', t('modal.apikeyTitle'), t('modal.apikeyDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -2260,6 +2495,37 @@
       '<button class="btn btn-primary" id="importCredBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
       '</div>';
     $('importCredBtn').addEventListener('click', importCredentials);
+  }
+  function modalApiKey(title, body) {
+    title.textContent = t('modal.apikeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apikeyDesc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.keyLabel')) + '</label>' +
+      '<input type="password" id="apikeyInput" placeholder="' + escapeAttr(t('apikey.keyPlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.nicknameLabel')) + '</label>' +
+      '<input type="text" id="apikeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label>' +
+      '<input type="text" id="apikeyRegion" value="us-east-1" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="addKiroApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('addKiroApiKeyBtn').addEventListener('click', addApiKeyAccount);
+  }
+  async function addApiKeyAccount() {
+    const key = $('apikeyInput').value.trim();
+    if (!key) { toast(t('apikey.keyRequired'), 'warning'); return; }
+    const body = {
+      authMethod: 'api_key',
+      kiroApiKey: key,
+      nickname: $('apikeyNickname').value.trim() || '',
+      region: $('apikeyRegion').value.trim() || 'us-east-1',
+      enabled: true
+    };
+    const res = await api('/accounts', { method: 'POST', body: JSON.stringify(body) });
+    const d = await res.json();
+    if (d.success) { toast(t('apikey.success'), 'success'); closeModal(); loadAccounts(); }
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
   function modalCookie(title, body) {
     title.textContent = t('modal.cookieTitle');
@@ -2668,6 +2934,94 @@
     kiroSsoSession = '';
     showModal('add');
   }
+  function modalCodex(title, body) {
+    title.textContent = t('modal.codexTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.codexDesc')) + '</p>' +
+      '<div id="codexStep1">' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('codex.hostNote')) + '</p></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="startCodexBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
+      '</div>' +
+      '</div>' +
+      '<div id="codexStep2" class="hidden">' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('codex.openInstruction')) + '</p></div>' +
+      '<div class="form-group mt-3"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
+      '<div class="endpoint"><span id="codexSignInUrl" class="font-mono text-xs"></span></div>' +
+      '<div class="flex gap-2 mt-2">' +
+      '<button class="btn btn-sm btn-outline flex-1" id="codexOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
+      '<button class="btn btn-sm btn-outline flex-1" id="codexCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+      '</div>' +
+      '</div>' +
+      '<div class="form-group mt-3"><label>' + escapeHtml(t('codex.callbackLabel')) + '</label>' +
+      '<input type="text" id="codexCallbackInput" placeholder="http://localhost:1455/auth/callback?code=..." />' +
+      '<p class="help-block">' + escapeHtml(t('codex.callbackHint')) + '</p></div>' +
+      '<p id="codexStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" id="codexCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="codexCompleteBtn" type="button">' + escapeHtml(t('codex.complete')) + '</button>' +
+      '</div>' +
+      '</div>';
+    $('startCodexBtn').addEventListener('click', startCodexLogin);
+  }
+  async function startCodexLogin() {
+    const res = await api('/auth/codex/start', { method: 'POST', body: '{}' });
+    const d = await res.json();
+    if (d.error) { toast(d.error, 'error'); return; }
+    codexSession = d.sessionId;
+    $('codexStep1').classList.add('hidden');
+    $('codexStep2').classList.remove('hidden');
+    $('codexSignInUrl').textContent = d.signInUrl;
+    $('codexOpenBtn').addEventListener('click', () => window.open(d.signInUrl, '_blank'));
+    $('codexCopyBtn').addEventListener('click', () => { navigator.clipboard.writeText(d.signInUrl); toast(t('common.copied'), 'success'); });
+    $('codexCancelBtn').addEventListener('click', cancelCodexLogin);
+    $('codexCompleteBtn').addEventListener('click', completeCodexLogin);
+    pollCodex();
+  }
+  async function completeCodexLogin() {
+    if (!codexSession) return;
+    const callbackUrl = $('codexCallbackInput').value.trim();
+    if (!callbackUrl) { toast(t('codex.callbackRequired'), 'warning'); return; }
+    const res = await api('/auth/codex/complete', { method: 'POST', body: JSON.stringify({ sessionId: codexSession, callbackUrl }) });
+    const d = await res.json();
+    if (d.status === 'completed') {
+      codexSession = '';
+      toast(t('codex.success'), 'success');
+      closeModal();
+      loadAccounts();
+    } else {
+      toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+    }
+  }
+  async function pollCodex() {
+    if (!codexSession) return;
+    try {
+      const res = await api('/auth/codex/poll', { method: 'POST', body: JSON.stringify({ sessionId: codexSession }) });
+      const d = await res.json();
+      if (d.error) {
+        $('codexStatus').textContent = d.error;
+        codexSession = '';
+        return;
+      }
+      if (d.status === 'completed') {
+        codexSession = '';
+        toast(t('codex.success'), 'success');
+        closeModal();
+        loadAccounts();
+        return;
+      }
+    } catch (e) { /* keep polling */ }
+    codexPollTimer = setTimeout(pollCodex, 2000);
+  }
+  function cancelCodexLogin() {
+    if (codexPollTimer) { clearTimeout(codexPollTimer); codexPollTimer = null; }
+    if (codexSession) {
+      api('/auth/codex/cancel', { method: 'POST', body: JSON.stringify({ sessionId: codexSession }) }).catch(() => {});
+    }
+    codexSession = '';
+    showModal('add');
+  }
   async function startIamSso() {
     if (iamSession) {
       const res = await api('/auth/iam-sso/complete', {
@@ -2928,6 +3282,8 @@
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
     if (tab === 'logs') loadLogs();
+    if (tab === 'bot') loadBot();
+    if (tab === 'accounts') { loadProviderModels('kiro'); loadProviderModels('codex'); }
   }
 
   // Event wiring
@@ -3012,6 +3368,12 @@
     $('exportBtn').addEventListener('click', showExportModal);
     $('refreshAllModelsBtn').addEventListener('click', refreshAllModels);
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
+    $('addCodexBtn').addEventListener('click', () => showModal('codex'));
+    $('codexAssignProxyBtn').addEventListener('click', assignProxiesToSelected);
+    $('kiroModelsLoadBtn').addEventListener('click', () => loadProviderModels('kiro'));
+    $('kiroModelsAddBtn').addEventListener('click', () => addCustomModel('kiro'));
+    $('codexModelsLoadBtn').addEventListener('click', () => loadProviderModels('codex'));
+    $('codexModelsAddBtn').addEventListener('click', () => addCustomModel('codex'));
 
     $('selectAllCheckbox').addEventListener('change', e => toggleSelectAll(e.target.checked));
     qsa('[data-batch]').forEach(b => b.addEventListener('click', () => {
@@ -3024,7 +3386,14 @@
     $('filterSearch').addEventListener('input', onFilterChange);
     $('filterStatusSelect').addEventListener('change', onFilterChange);
 
-    $('accountsList').addEventListener('click', e => {
+    const modelRemoveHandler = e => {
+      const rm = e.target.closest('[data-model-remove]');
+      if (rm) removeCustomModel(rm.dataset.modelProvider, rm.dataset.modelRemove);
+    };
+    $('kiroModelsList').addEventListener('click', modelRemoveHandler);
+    $('codexModelsList').addEventListener('click', modelRemoveHandler);
+
+    const accountClickHandler = e => {
       const cb = e.target.closest('.account-checkbox');
       if (cb) {
         toggleSelectAccount(cb.dataset.id);
@@ -3043,7 +3412,9 @@
       else if (action === 'test') testAccount(id);
       else if (action === 'switchProfile') openSwitchProfileModal(id, btn);
       else if (action === 'delete') deleteAccount(id);
-    });
+    };
+    $('accountsList').addEventListener('click', accountClickHandler);
+    $('codexAccountsList').addEventListener('click', accountClickHandler);
   }
 
   function bindSettingsEvents() {
@@ -3054,6 +3425,10 @@
     $('changePasswordBtn').addEventListener('click', changePassword);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
+    $('addProxyPoolBtn').addEventListener('click', () => addProxyPoolRow(''));
+    $('saveProxyPoolBtn').addEventListener('click', saveProxyPool);
+    $('batchAssignProxyBtn').addEventListener('click', assignProxiesToSelected);
+    $('saveCodexPrefixBtn').addEventListener('click', saveCodexPrefix);
     $('resetStatsBtn').addEventListener('click', resetStats);
     bindApiKeyEvents();
   }
@@ -3078,6 +3453,9 @@
       const rm = e.target.closest('[data-rule-remove]');
       if (rm) { promptRules.splice(parseInt(rm.dataset.ruleRemove, 10), 1); renderPromptRules(); }
     });
+    $('botSaveConfigBtn').addEventListener('click', saveBotConfig);
+    $('botAddPackageBtn').addEventListener('click', () => botAddPackageRow());
+    $('botRefreshOrdersBtn').addEventListener('click', () => { loadBotOrders(); });
   }
 
   function bindModalEvents() {

@@ -109,6 +109,8 @@
                 data-i18n="tabs.api"></span></button>
             <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-list tab-icon"></i><span
                 data-i18n="tabs.logs"></span></button>
+            <button type="button" class="tab" data-tab="bot"><i class="fa-solid fa-robot tab-icon"></i><span
+                data-i18n="tabs.bot"></span></button>
           </div>
         </nav>
         <div class="topbar-actions flex-wrap justify-end">
@@ -217,6 +219,8 @@
               <button class="btn btn-secondary btn-xs" data-batch="refresh" data-i18n="batch.refresh"></button>
               <button class="btn btn-secondary btn-xs" data-batch="refreshModels"
                 data-i18n="batch.refreshModels"></button>
+              <button class="btn btn-secondary btn-xs" id="batchAssignProxyBtn"
+                data-i18n="batch.assignProxy"></button>
               <button class="btn btn-danger btn-xs" data-batch="delete" data-i18n="batch.delete"></button>
             </div>
             <div class="toolbar-spacer"></div>
@@ -230,6 +234,36 @@
           </div>
 
           <div id="accountsList"></div>
+
+          <div class="detail-section" style="margin-top:1rem;">
+            <h4 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <span data-i18n="models.kiroTitle"></span>
+              <button class="btn btn-sm btn-outline" id="kiroModelsLoadBtn" data-i18n="models.loadAll"></button>
+              <button class="btn btn-sm btn-outline" id="kiroModelsAddBtn" data-i18n="models.addCustom"></button>
+            </h4>
+            <div id="kiroModelsList" class="model-list"></div>
+          </div>
+        </div>
+
+        <!-- Codex account list -->
+        <div class="card" style="margin-top:1rem;">
+          <div class="card-header">
+            <span class="card-title" data-i18n="accounts.codexTitle"></span>
+            <div class="card-actions">
+              <button class="btn btn-secondary btn-xs" id="codexAssignProxyBtn" data-i18n="batch.assignProxy"></button>
+              <button class="btn btn-primary btn-sm" id="addCodexBtn"><i class="fa-solid fa-robot" aria-hidden="true"></i><span class="btn-text" data-i18n="accounts.addCodex"></span></button>
+            </div>
+          </div>
+          <div id="codexAccountsList"></div>
+
+          <div class="detail-section" style="margin-top:1rem;">
+            <h4 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <span data-i18n="models.codexTitle"></span>
+              <button class="btn btn-sm btn-outline" id="codexModelsLoadBtn" data-i18n="models.loadAll"></button>
+              <button class="btn btn-sm btn-outline" id="codexModelsAddBtn" data-i18n="models.addCustom"></button>
+            </h4>
+            <div id="codexModelsList" class="model-list"></div>
+          </div>
         </div>
       </div>
 
@@ -363,6 +397,28 @@
             </div>
           </div>
           <button class="btn btn-primary" id="saveProxyBtn" data-i18n="settings.saveProxy"></button>
+        </div>
+
+        <!-- Proxy pool -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.proxyPool"></span></div>
+          <p class="help-block" data-i18n="settings.proxyPoolHint"></p>
+          <div id="proxyPoolList" class="flex flex-col gap-2 mt-2"></div>
+          <div class="flex gap-2 mt-3">
+            <button class="btn btn-secondary" id="addProxyPoolBtn" data-i18n="settings.addProxy"></button>
+            <button class="btn btn-primary" id="saveProxyPoolBtn" data-i18n="settings.saveProxyPool"></button>
+          </div>
+        </div>
+
+        <!-- Codex routing -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.codexTitle"></span></div>
+          <p class="help-block" data-i18n="settings.codexHint"></p>
+          <div class="form-group">
+            <label data-i18n="settings.codexPrefix"></label>
+            <input type="text" id="codexRoutePrefix" placeholder="gpt" />
+          </div>
+          <button class="btn btn-primary" id="saveCodexPrefixBtn" data-i18n="settings.saveCodexPrefix"></button>
         </div>
 
         <!-- Prompt filter -->
@@ -512,6 +568,69 @@
           <div class="logs-summary" id="logsSummary"></div>
           <div id="logsList" class="logs-list">
             <p class="text-muted" data-i18n="logs.empty"></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Bot tab -->
+      <div id="tabBot" class="tab-content hidden">
+        <!-- Revenue / stats -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="bot.statsTitle"></span></div>
+          <div class="logs-summary" id="botStatsSummary"></div>
+        </div>
+
+        <!-- Bot configuration -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="bot.configTitle"></span></div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="botEnabled" /><span class="slider"></span></span>
+              <span data-i18n="bot.enabled"></span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label data-i18n="bot.telegramToken"></label>
+            <input type="password" id="botTelegramToken" autocomplete="new-password" data-i18n-placeholder="bot.secretUnchanged" />
+          </div>
+          <div class="form-group">
+            <label data-i18n="bot.publicBaseUrl"></label>
+            <input type="text" id="botPublicBaseUrl" placeholder="https://proxy.example.com" />
+            <p class="help-block" data-i18n="bot.publicBaseUrlHint"></p>
+          </div>
+          <div class="form-group">
+            <label data-i18n="bot.cryptomusMerchantId"></label>
+            <input type="text" id="botCryptomusMerchantId" />
+          </div>
+          <div class="form-group">
+            <label data-i18n="bot.cryptomusApiKey"></label>
+            <input type="password" id="botCryptomusApiKey" autocomplete="new-password" data-i18n-placeholder="bot.secretUnchanged" />
+          </div>
+          <div class="form-group">
+            <label data-i18n="bot.pricePerCredit"></label>
+            <input type="number" id="botPricePerCredit" step="0.0001" min="0" placeholder="0.01" />
+          </div>
+          <div class="form-group">
+            <label data-i18n="bot.minCredits"></label>
+            <input type="number" id="botMinCredits" step="1" min="0" placeholder="10" />
+          </div>
+          <div class="form-group">
+            <label data-i18n="bot.packages"></label>
+            <p class="help-block" data-i18n="bot.packagesHint"></p>
+            <div id="botPackagesList" class="flex flex-col gap-2 mt-2"></div>
+            <button class="btn btn-secondary mt-2" id="botAddPackageBtn" data-i18n="bot.addPackage"></button>
+          </div>
+          <button class="btn btn-primary" id="botSaveConfigBtn" data-i18n="bot.saveConfig"></button>
+        </div>
+
+        <!-- Orders -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="bot.ordersTitle"></span>
+            <button class="btn btn-outline btn-sm" id="botRefreshOrdersBtn"><i class="fa-solid fa-rotate"></i><span class="btn-text" data-i18n="bot.refresh"></span></button>
+          </div>
+          <div id="botOrdersList" class="logs-list">
+            <p class="text-muted" data-i18n="bot.ordersEmpty"></p>
           </div>
         </div>
       </div>

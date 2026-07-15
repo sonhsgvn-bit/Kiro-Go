@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,7 +46,9 @@ type Account struct {
 	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
 	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
 	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), or "external_idp" (enterprise SSO, e.g. Azure AD)
+	KiroApiKey   string `json:"kiroApiKey,omitempty"`   // API key credential for headless auth (used directly as bearer token)
+	CodexAccountID string `json:"codexAccountId,omitempty"` // ChatGPT (Codex) account id, sent as chatgpt-account-id header
+	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), "external_idp" (enterprise SSO, e.g. Azure AD), "api_key", or "codex" (ChatGPT)
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
 	Region       string `json:"region"`                 // AWS region for OIDC endpoints
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
@@ -117,6 +120,17 @@ type Account struct {
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
 }
 
+// IsApiKeyCredential returns true if this account is authenticated via API key.
+// An account is an API-key credential if KiroApiKey is non-empty OR if authMethod
+// is "api_key" or "apikey" (case-insensitive).
+func (a *Account) IsApiKeyCredential() bool {
+	if a.KiroApiKey != "" {
+		return true
+	}
+	method := strings.ToLower(a.AuthMethod)
+	return method == "api_key" || method == "apikey"
+}
+
 // PromptFilterRule defines a single custom prompt sanitization rule.
 // Type can be: "regex" (regexp find/replace within prompt) or
 // "lines-containing" (remove lines containing the match substring).
@@ -182,11 +196,26 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// CodexRoutePrefix is the model-name prefix that routes a request to a ChatGPT
+	// (Codex) account instead of Kiro, e.g. with prefix "gpt" a model "gpt/gpt-5.6"
+	// is served by a codex account as "gpt-5.6". Empty disables codex routing.
+	CodexRoutePrefix string `json:"codexRoutePrefix,omitempty"`
+
+	// CustomModels holds operator-added model IDs per provider ("kiro" | "codex"),
+	// shown in the Available Models list alongside models discovered from accounts.
+	CustomModels map[string][]string `json:"customModels,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
+
+	// ProxyPool is an optional list of outbound proxy URLs (same format as
+	// ProxyURL) used as a source for assigning per-account proxies. It does not
+	// affect routing by itself; accounts still fall back to ProxyURL when they
+	// have no per-account proxy set.
+	ProxyPool []string `json:"proxyPool,omitempty"`
 
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
@@ -217,6 +246,29 @@ type Config struct {
 	FailedRequests  int     `json:"failedRequests,omitempty"`  // Failed requests count
 	TotalTokens     int     `json:"totalTokens,omitempty"`     // Total tokens processed
 	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
+
+	// Bot is the Telegram sales-bot configuration (nil/disabled until set up).
+	Bot *BotConfig `json:"bot,omitempty"`
+}
+
+// BotConfig holds the Telegram sales bot + Cryptomus payment settings.
+type BotConfig struct {
+	Enabled             bool          `json:"enabled"`
+	TelegramToken       string        `json:"telegramToken,omitempty"`       // BotFather token
+	CryptomusMerchantID string        `json:"cryptomusMerchantId,omitempty"` // Cryptomus merchant UUID
+	CryptomusAPIKey     string        `json:"cryptomusApiKey,omitempty"`     // Cryptomus payment API key (signs invoices + webhook)
+	PublicBaseURL       string        `json:"publicBaseUrl,omitempty"`       // Public https base URL for the webhook callback, e.g. https://proxy.example.com
+	PricePerCredit      float64       `json:"pricePerCredit,omitempty"`      // USD price for one credit (used for custom-amount purchases)
+	MinCredits          float64       `json:"minCredits,omitempty"`          // Minimum credits a customer may buy custom
+	Packages            []BotPackage  `json:"packages,omitempty"`            // Fixed packages offered in the bot
+}
+
+// BotPackage is a fixed purchase option shown in the bot's /buy menu.
+type BotPackage struct {
+	ID      string  `json:"id"`      // Stable identifier used in callback data
+	Label   string  `json:"label"`   // Display name, e.g. "Starter"
+	Credits float64 `json:"credits"` // Credits granted on purchase
+	Price   float64 `json:"price"`   // USD price
 }
 
 // AccountInfo contains account metadata retrieved from Kiro API.
@@ -550,6 +602,21 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	return fmt.Errorf("account not found: %s", id)
 }
 
+// SetAccountProxy updates only the per-account ProxyURL under the write lock,
+// so it does not clobber concurrent field updates (token refresh, stats) the way
+// a full UpdateAccount(*copy) would.
+func SetAccountProxy(id, proxyURL string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].ProxyURL = proxyURL
+			return Save()
+		}
+	}
+	return fmt.Errorf("account not found: %s", id)
+}
+
 func DeleteAccount(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -858,6 +925,44 @@ func UpdateProxySettings(proxyURL string) error {
 	return Save()
 }
 
+// GetProxyPool returns a copy of the configured proxy pool.
+func GetProxyPool() []string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	pool := make([]string, len(cfg.ProxyPool))
+	copy(pool, cfg.ProxyPool)
+	return pool
+}
+
+// UpdateProxyPool replaces the proxy pool and persists it.
+func UpdateProxyPool(pool []string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ProxyPool = pool
+	return Save()
+}
+
+// GetBotConfig returns a copy of the bot configuration, or a zero-value
+// (disabled) config when the bot has never been set up.
+func GetBotConfig() BotConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.Bot == nil {
+		return BotConfig{}
+	}
+	c := *cfg.Bot
+	c.Packages = append([]BotPackage(nil), cfg.Bot.Packages...)
+	return c
+}
+
+// UpdateBotConfig replaces the bot configuration and persists it.
+func UpdateBotConfig(bc BotConfig) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.Bot = &bc
+	return Save()
+}
+
 // GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.
 func GetAllowOverUsage() bool {
 	cfgLock.RLock()
@@ -873,6 +978,72 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// GetCodexRoutePrefix returns the model-name prefix that routes requests to a
+// ChatGPT (Codex) account. Empty means codex routing is disabled.
+func GetCodexRoutePrefix() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.CodexRoutePrefix
+}
+
+// UpdateCodexRoutePrefix sets the codex route prefix and persists the change.
+func UpdateCodexRoutePrefix(prefix string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.CodexRoutePrefix = prefix
+	return Save()
+}
+
+// GetCustomModels returns operator-added model IDs for a provider ("kiro" | "codex").
+func GetCustomModels(provider string) []string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.CustomModels == nil {
+		return []string{}
+	}
+	list := cfg.CustomModels[provider]
+	out := make([]string, len(list))
+	copy(out, list)
+	return out
+}
+
+// AddCustomModel adds a model ID to a provider's custom list (deduped) and persists.
+func AddCustomModel(provider, modelID string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.CustomModels == nil {
+		cfg.CustomModels = make(map[string][]string)
+	}
+	for _, m := range cfg.CustomModels[provider] {
+		if strings.EqualFold(m, modelID) {
+			return Save()
+		}
+	}
+	cfg.CustomModels[provider] = append(cfg.CustomModels[provider], modelID)
+	return Save()
+}
+
+// RemoveCustomModel removes a model ID from a provider's custom list and persists.
+func RemoveCustomModel(provider, modelID string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.CustomModels == nil {
+		return nil
+	}
+	list := cfg.CustomModels[provider]
+	out := list[:0:0]
+	for _, m := range list {
+		if !strings.EqualFold(m, modelID) {
+			out = append(out, m)
+		}
+	}
+	cfg.CustomModels[provider] = out
 	return Save()
 }
 

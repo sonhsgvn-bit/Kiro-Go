@@ -42,6 +42,12 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	if account.AuthMethod == "social" {
 		return refreshSocialToken(account.RefreshToken, client)
 	}
+	// Codex (ChatGPT) tokens are refreshed against the OpenAI token endpoint. The
+	// profileArn slot is unused for codex, so "" is returned for it.
+	if account.AuthMethod == "codex" {
+		access, refresh, expiresAt, err := RefreshCodexToken(account.RefreshToken, client)
+		return access, refresh, expiresAt, "", err
+	}
 	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
 }
 

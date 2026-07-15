@@ -96,6 +96,11 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		if seen[acc.ID] {
 			continue
 		}
+		// Codex (ChatGPT) accounts are never valid for Kiro data-plane calls.
+		if acc.AuthMethod == "codex" {
+			seen[acc.ID] = true
+			continue
+		}
 
 		// 跳过冷却中的账号
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
@@ -124,6 +129,10 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 	for i := range p.accounts {
 		acc := &p.accounts[i]
 		if excluded != nil && excluded[acc.ID] {
+			continue
+		}
+		// Codex (ChatGPT) accounts are never valid for Kiro data-plane calls.
+		if acc.AuthMethod == "codex" {
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
@@ -210,6 +219,12 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		if seen[acc.ID] {
 			continue
 		}
+		// Codex (ChatGPT) accounts are served by a separate handler and must never
+		// be picked for Kiro data-plane calls (their token is not valid for AWS).
+		if acc.AuthMethod == "codex" {
+			seen[acc.ID] = true
+			continue
+		}
 		if !p.accountHasModel(acc.ID, model) {
 			seen[acc.ID] = true
 			continue
@@ -235,6 +250,10 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	for i := range p.accounts {
 		acc := &p.accounts[i]
 		if excluded != nil && excluded[acc.ID] {
+			continue
+		}
+		// Codex (ChatGPT) accounts are never valid for Kiro data-plane calls.
+		if acc.AuthMethod == "codex" {
 			continue
 		}
 		if !p.accountHasModel(acc.ID, model) {

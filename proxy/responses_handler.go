@@ -30,6 +30,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Route to a ChatGPT (Codex) account when the model carries the codex prefix.
+	if isCodex, realModel := isCodexModel(strings.TrimSpace(req.Model)); isCodex {
+		h.handleCodexResponses(w, r, body, realModel, apiKeyIDFromContext(r.Context()))
+		return
+	}
+
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = defaultResponsesModel
 	}
